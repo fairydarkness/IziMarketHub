@@ -219,6 +219,10 @@ def test_tg_menus(api, hub, monkeypatch):
     shown = []
     monkeypatch.setattr(tg, "_edit", lambda c, text, kb=None: shown.append((c.data, text, kb)))
     monkeypatch.setattr(tg, "send", lambda chat, text, markup=None: shown.append(("send", text, markup)))
+    tg.bind()  # методы-обработчики регистрируются в ядре
+    api.add_order("o0", P_MANUAL)
+    hub.dispatch("NEW_ORDER", hub.client.get_order("o0"))
+    assert shown and shown[-1][0] == "send" and "Новая сделка" in shown[-1][1]
     monkeypatch.setattr(tg.bot, "answer_callback_query", lambda *a, **k: None)
 
     def click(data):

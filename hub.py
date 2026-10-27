@@ -77,7 +77,7 @@ class IziMarketHub:
         self.running = False
         self.start_time = time.time()
 
-        self.handlers: dict[str, list[Callable]] = {e: [] for e in EVENTS}
+        self.handlers: dict[str, list[tuple[Callable, str | None]]] = {e: [] for e in EVENTS}
         self.plugins: dict[str, PluginData] = {}
 
         self._orders_lock = threading.RLock()
@@ -108,12 +108,11 @@ class IziMarketHub:
     def add_handler(self, event: str, fn: Callable, plugin_uuid: str | None = None) -> None:
         if event not in self.handlers:
             raise ValueError(f"Неизвестное событие {event}")
-        fn.plugin_uuid = plugin_uuid
-        self.handlers[event].append(fn)
+        # (функция, uuid плагина): атрибут на bound-метод не повесить
+        self.handlers[event].append((fn, plugin_uuid))
 
     def dispatch(self, event: str, *args) -> None:
-        for fn in list(self.handlers[event]):
-            uuid = getattr(fn, "plugin_uuid", None)
+        for fn, uuid in list(self.handlers[event]):
             if uuid and (uuid not in self.plugins or not self.plugins[uuid].enabled):
                 continue
             try:
