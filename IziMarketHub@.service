@@ -1,0 +1,16 @@
+[Unit]
+Description=IziMarketHub — бот продавца IziMarket (@fairydarkns)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/IziMarketHub
+ExecStart=/home/%i/IziMarketHub/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

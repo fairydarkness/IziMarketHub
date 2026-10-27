@@ -1,0 +1,13 @@
+services:
+  imh:
+    build: .
+    container_name: izimarkethub
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./configs:/app/configs
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+      - ./plugins:/app/plugins
+    # для вебхуков: ports: ["127.0.0.1:8080:8080"] и [Webhook] host = 0.0.0.0
