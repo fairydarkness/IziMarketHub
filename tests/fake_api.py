@@ -86,10 +86,25 @@ class FakeAPI:
                         "prefix": "izp_test", "scopes": ["orders:read", "orders:write", "products:read",
                                                          "products:write", "stock:read", "stock:write"],
                         "expires_at": "2030-01-01T00:00:00+00:00"}})
+                if path == "/balance":
+                    return self._send(200, {"balance": money(170000), "held": money(5000),
+                                            "available": money(165000), "spend_only": money(0), "currency": "RUB"})
+                if path == "/analytics/metrics":
+                    return self._send(200, {"metrics": [{"key": "earned", "label": "К получению"},
+                                                        {"key": "rating", "label": "Рейтинг"}]})
+                if path == "/analytics":
+                    # формы как у настоящего API: не только деньги
+                    return self._send(200, {"period": {"from": "2026-10-21", "to": "2026-10-27"},
+                                            "current": {"earned": money(71100), "sales": 3, "rating": {"average": 4.9, "reviews_count": 12},
+                                                        "dispute_rate": 0.125, "margin": None, "views": {"total": 40}},
+                                            "previous": {"earned": money(0), "sales": 0}})
                 if path == "/orders":
                     items = list(api.orders.values())
                     if "status" in params:
                         items = [o for o in items if o["status"] == params["status"]]
+                    if "created_from" in params:
+                        cf = datetime.fromisoformat(params["created_from"]).replace(tzinfo=timezone.utc)
+                        items = [o for o in items if datetime.fromisoformat(o["created_at"]) >= cf]
                     if "updated_since" in params:
                         since = datetime.fromisoformat(params["updated_since"])
                         items = [o for o in items if datetime.fromisoformat(o["updated_at"]) >= since]

@@ -247,3 +247,97 @@ def test_tg_menus(api, hub, monkeypatch):
     from tg_bot import utils as u
     h = u.hash_password("secret123")
     assert u.check_password("secret123", h) and not u.check_password("nope", h)
+
+
+def test_tg_menu_pages_balance_stats(api, hub, monkeypatch):
+    from types import SimpleNamespace
+    from tg_bot.bot import MENU_PAGES, TGBot
+    hub.MAIN_CFG.set("Telegram", "token", "123:fake")
+    api.add_product(P_MANUAL, "Ключ Hades")
+    api.add_order("a", P_MANUAL, status="paid")
+    api.add_order("b", P_MANUAL, status="delivered")
+    api.add_order("c", P_MANUAL, status="completed")
+    api.orders["c"].update(paid_out_at=None, payout_held=True, payout_due_at="2026-11-01T12:00:00+00:00")
+    api.add_order("d", P_MANUAL, status="completed")
+    api.orders["d"].update(paid_out_at="2026-10-20T12:00:00+00:00")
+    tg = TGBot(hub)
+    tg._authorize(1)
+    shown = []
+    monkeypatch.setattr(tg, "_edit", lambda c, text, kb=None: shown.append((c.data, text, kb)))
+    monkeypatch.setattr(tg.bot, "answer_callback_query", lambda *a, **k: None)
+
+    def click(data):
+        tg._callback(SimpleNamespace(id="1", data=data, message=SimpleNamespace(chat=SimpleNamespace(id=1))))
+        return shown[-1] if shown else None
+
+    def buttons(kb):
+        return [b.callback_data for row in kb.keyboard for b in row]
+
+    # две страницы, на каждой — свои кнопки и навигация
+    p1 = buttons(tg.main_menu(0))
+    p2 = buttons(tg.main_menu(1))
+    assert "orders" in p1 and "sw" not in p1 and "menu:1" in p1 and "menu:-1" not in p1
+    assert "sw" in p2 and "orders" not in p2 and "menu:0" in p2 and "menu:2" not in p2
+    assert len(MENU_PAGES) == 2
+    click("menu:1")
+    assert "sw" in buttons(shown[-1][2])
+    click("noop")
+    # «Назад» из раздела второй страницы ведёт на вторую страницу
+    assert buttons(click("sw")[2])[-1] == "menu:1"
+    assert buttons(click("balance")[2])[-1] == "menu"
+
+    text = click("balance")[1]
+    assert "Заморожено операциями" in text and "50 ₽" in text
+    assert "В незакрытых сделках: <b>180 ₽</b> (2 шт.)" in text
+    assert "Ждут выплаты: <b>90 ₽</b> (1 шт.)" in text
+    assert "Задержано площадкой" in text and "Итого в холде: <b>270 ₽</b>" in text
+
+    text = click("stats")[1]
+    assert "К получению: <b>711 ₽</b>" in text
+    assert "Рейтинг: <b>4.9 (12 отз.)</b>" in text and "dispute_rate: <b>0.12%" in text and "margin: <b>—</b>" in text
+
+
+def test_updater(tmp_path, monkeypatch):
+    import subprocess
+    from Utils import updater
+
+    def git(cwd, *a):
+        subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    origin, work, clone = tmp_path / "origin.git", tmp_path / "work", tmp_path / "clone"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    git(tmp_path, "clone", "-q", str(origin), str(work))
+    (work / "main.py").write_text("v1\n")
+    (work / ".gitignore").write_text("configs/\n")
+    git(work, "add", ".")
+    git(work, "commit", "-qm", "v1")
+    git(work, "push", "-q", "origin", "HEAD:main")
+    git(tmp_path, "clone", "-q", str(origin), str(clone))
+    monkeypatch.setattr(updater, "ROOT", str(clone))
+
+    assert updater.pending_commits() == []
+    (work / "main.py").write_text("v2\n")
+    git(work, "commit", "-qam", "Новая фича")
+    git(work, "push", "-q", "origin", "HEAD:main")
+    assert [c.split(" ", 1)[1] for c in updater.pending_commits()] == ["Новая фича"]
+
+    # ручная правка отслеживаемого файла — отказ, ничего не перезаписано
+    (clone / "main.py").write_text("my edit\n")
+    with pytest.raises(updater.UpdateError, match="изменены вручную"):
+        updater.update()
+    assert (clone / "main.py").read_text() == "my edit\n"
+
+    # конфиги в .gitignore не мешают и не трогаются
+    git(clone, "checkout", "--", ".")
+    (clone / "configs").mkdir()
+    (clone / "configs" / "_main.cfg").write_text("secret\n")
+    assert len(updater.update()) == 1
+    assert (clone / "main.py").read_text() == "v2\n"
+    assert (clone / "configs" / "_main.cfg").read_text() == "secret\n"
+    assert updater.update() == []
+
+    monkeypatch.setattr(updater, "ROOT", str(tmp_path))
+    with pytest.raises(updater.UpdateError, match="не git-репозиторий"):
+        updater.check_ready()

@@ -15,9 +15,10 @@ import telebot
 from telebot import apihelper
 from telebot.types import (BotCommand, CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup, Message)
 
-from IziAPI import Order, Product
+from IziAPI import Money, Order, Product
 from IziAPI.exceptions import IziAPIError, NetworkError
 from Utils.config_loader import AD_SCHEMA, is_true
+from Utils import updater
 from Utils.logger import LOG_FILE
 from . import utils as u
 
@@ -47,9 +48,50 @@ LOGIN_BLOCK_SECONDS = 600
 
 DEFAULT_RESPONSE = "Спасибо за покупку, $username!\\nВаш товар:\\n$product"
 
+# страницы главного меню: (подпись, callback)
+MENU_PAGES = [
+    [("🧾 Сделки", "orders"), ("🛍 Мои товары", "pr:1"),
+     ("📦 Автовыдача", "ad:0"), ("📁 Файлы товаров", "gf"),
+     ("💰 Баланс", "balance"), ("📊 Статистика", "stats")],
+    [("⚙️ Переключатели", "sw"), ("🔔 Уведомления", "nt"),
+     ("🧩 Плагины", "pl"), ("🔄 Обновление", "upd"),
+     ("ℹ️ О боте", "about")],
+]
+# «Назад» из раздела возвращает на ту страницу меню, где он лежит
+MENU_PAGE_OF = {cb.split(":")[0]: i for i, page in enumerate(MENU_PAGES) for _, cb in page}
+
 
 def _onoff(v: bool) -> str:
     return "🟢" if v else "🔴"
+
+
+# показатели-доли API отдаёт в процентах (dispute_rate = 100 → 100%)
+PERCENT_METRICS = {"dispute_rate", "refund_rate", "conversion", "margin", "cost_coverage"}
+
+
+def _num(v) -> str:
+    return f"{v:.2f}".rstrip("0").rstrip(".") if isinstance(v, float) else str(v)
+
+
+def _fmt_metric(v, key: str = "") -> str:
+    """Показатель аналитики любой формы: деньги, число, процент или объект вроде рейтинга."""
+    if v is None:
+        return "—"
+    if isinstance(v, dict):
+        if "amount_minor" in v:
+            return str(Money.from_dict(v))
+        if "average" in v:  # рейтинг: {"average": 5, "reviews_count": 1}
+            if v["average"] is None:
+                return "—"
+            count = v.get("reviews_count", v.get("count"))
+            return f"{_num(v['average'])}" + (f" ({count} отз.)" if count is not None else "")
+        for k in ("value", "percent", "rate", "count", "total"):
+            if k in v and not isinstance(v[k], (dict, list)):
+                return _fmt_metric(v[k], key)
+        return ", ".join(f"{k}: {_fmt_metric(x)}" for k, x in v.items()) or "—"
+    if isinstance(v, (int, float)) and key in PERCENT_METRICS:
+        return f"{_num(v)}%"
+    return _num(v)
 
 
 class TGBot:
@@ -87,6 +129,8 @@ class TGBot:
                 fn(obj)
             except (IziAPIError, NetworkError) as e:
                 self.bot.send_message(chat_id, f"❌ Ошибка API: {escape(str(e))}")
+            except updater.UpdateError as e:
+                self.bot.send_message(chat_id, f"❌ Обновление не удалось:\n<pre>{escape(str(e))[:3500]}</pre>")
             except Exception:
                 logger.error(traceback.format_exc())
                 self.bot.send_message(chat_id, "❌ Внутренняя ошибка, подробности в логе")
@@ -166,17 +210,22 @@ class TGBot:
 
     # ------------------------------------------------------------------ меню
 
-    def main_menu(self) -> InlineKeyboardMarkup:
+    def main_menu(self, page: int = 0) -> InlineKeyboardMarkup:
+        page = max(0, min(page, len(MENU_PAGES) - 1))
         kb = InlineKeyboardMarkup(row_width=2)
-        kb.add(Btn("⚙️ Переключатели", callback_data="sw"), Btn("🔔 Уведомления", callback_data="nt"))
-        kb.add(Btn("📦 Автовыдача", callback_data="ad:0"), Btn("📁 Файлы товаров", callback_data="gf"))
-        kb.add(Btn("🧾 Сделки", callback_data="orders"), Btn("🛍 Мои товары", callback_data="pr:1"))
-        kb.add(Btn("💰 Баланс", callback_data="balance"), Btn("📊 Статистика", callback_data="stats"))
-        kb.add(Btn("🧩 Плагины", callback_data="pl"), Btn("ℹ️ О боте", callback_data="about"))
+        kb.add(*(Btn(title, callback_data=cb) for title, cb in MENU_PAGES[page]))
+        nav = [Btn("◀️", callback_data=f"menu:{page - 1}") if page > 0 else Btn(" ", callback_data="noop"),
+               Btn(f"{page + 1}/{len(MENU_PAGES)}", callback_data="noop"),
+               Btn("▶️", callback_data=f"menu:{page + 1}") if page < len(MENU_PAGES) - 1
+               else Btn(" ", callback_data="noop")]
+        kb.row(*nav)
         return kb
 
-    def _back(self, kb: InlineKeyboardMarkup | None = None, to: str = "menu") -> InlineKeyboardMarkup:
+    def _back(self, kb: InlineKeyboardMarkup | None = None, to: str = "menu",
+              section: str | None = None) -> InlineKeyboardMarkup:
         kb = kb or InlineKeyboardMarkup()
+        if to == "menu" and section:
+            to = f"menu:{MENU_PAGE_OF.get(section, 0)}"
         kb.add(Btn("◀️ Назад", callback_data=to))
         return kb
 
@@ -193,14 +242,14 @@ class TGBot:
         kb = InlineKeyboardMarkup()
         for key, title in GLOBAL_SWITCHES.items():
             kb.add(Btn(f"{_onoff(self.hub.setting(key))} {title}", callback_data=f"swt:{key}"))
-        return "⚙️ <b>Глобальные переключатели</b>", self._back(kb)
+        return "⚙️ <b>Глобальные переключатели</b>", self._back(kb, section="sw")
 
     def notify_view(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
         prefs = self.chats.get(str(chat_id), {})
         kb = InlineKeyboardMarkup()
         for key, title in NOTIFY_KINDS.items():
             kb.add(Btn(f"{_onoff(prefs.get(key, True))} {title}", callback_data=f"ntt:{key}"))
-        return "🔔 <b>Уведомления в этот чат</b>", self._back(kb)
+        return "🔔 <b>Уведомления в этот чат</b>", self._back(kb, section="nt")
 
     def ad_view(self, page: int) -> tuple[str, InlineKeyboardMarkup]:
         sections = self.hub.AD_CFG.sections()
@@ -297,7 +346,7 @@ class TGBot:
         kb.add(Btn("➕ Добавить плагин", callback_data="pladd"))
         text = ("🧩 <b>Плагины</b>\n\n⚠️ Ставьте плагины только из проверенных источников: "
                 "плагин получает полный доступ к компьютеру и ключу API.")
-        return text, self._back(kb)
+        return text, self._back(kb, section="pl")
 
     def about_text(self) -> str:
         from hub import AUTHOR, AUTHOR_LINK, VERSION
@@ -306,15 +355,51 @@ class TGBot:
                 f"Автор: <a href=\"{AUTHOR_LINK}\">{AUTHOR}</a>\n"
                 f"Аккаунт: {u.b(self.hub.me.get('username', '?'))}\n"
                 f"Работает: {up // 3600} ч {up % 3600 // 60} мин\n"
-                f"Плагинов: {len(self.hub.plugins)}")
+                f"Плагинов: {len(self.hub.plugins)}\n"
+                f"Репозиторий: <a href=\"{updater.REPO_URL}\">GitHub</a>")
+
+    def update_view(self) -> tuple[str, InlineKeyboardMarkup]:
+        commits = updater.pending_commits()
+        kb = InlineKeyboardMarkup()
+        if not commits:
+            return "✅ У вас последняя версия IziMarketHub", self._back(kb, section="upd")
+        shown = "\n".join(f"• {escape(c)}" for c in commits[:15])
+        more = f"\n…и ещё {len(commits) - 15}" if len(commits) > 15 else ""
+        kb.add(Btn("⬇️ Обновить и перезапустить", callback_data="updgo"))
+        return (f"🔄 <b>Доступно обновление</b> ({len(commits)} изм.)\n\n{shown}{more}\n\n"
+                "Настройки, товары и логи не затрагиваются."), self._back(kb, section="upd")
+
+    def _restart(self, chat_id: int, text: str) -> None:
+        self.send(chat_id, text)
+        self.hub.store.set("restart_notify", chat_id)
+        # даём Telegram отправить сообщение, потом заменяем процесс
+        threading.Timer(1.5, updater.restart).start()
 
     # ------------------------------------------------------------------ данные
 
     def balance_text(self) -> str:
         bal = self.hub.client.get_balance()
-        return (f"💰 <b>Баланс</b>\nВсего: {u.b(bal.balance)}\nДоступно: {u.b(bal.available)}\n"
-                f"Забронировано: {escape(str(bal.held))}"
-                + (f"\nТолько на покупки: {escape(str(bal.spend_only))}" if bal.spend_only else ""))
+        lines = [f"💰 <b>Баланс кошелька</b>",
+                 f"Всего: {u.b(bal.balance)}",
+                 f"Доступно: {u.b(bal.available)}",
+                 f"Заморожено операциями: {escape(str(bal.held))}"]
+        if bal.spend_only and bal.spend_only.amount_minor:
+            lines.append(f"Только на покупки: {escape(str(bal.spend_only))}")
+        # API баланса не отдаёт деньги продаж в холде — считаем их по сделкам
+        try:
+            h = self.hub.sales_on_hold()
+        except (IziAPIError, NetworkError) as e:
+            lines.append(f"\n🧊 Холд по продажам посчитать не удалось: {escape(str(e))}")
+            return "\n".join(lines)
+        lines += ["", "🧊 <b>Холд по продажам</b>",
+                  f"В незакрытых сделках: {u.b(h['in_deals'])} ({h['in_deals_count']} шт.)",
+                  f"Ждут выплаты: {u.b(h['awaiting'])} ({h['awaiting_count']} шт.)"]
+        if h["nearest_payout"]:
+            lines.append(f"Ближайшая выплата: {h['nearest_payout'].astimezone().strftime('%d.%m %H:%M')}")
+        if h["held_count"]:
+            lines.append(f"🔒 Задержано площадкой: {u.b(h['held'])} ({h['held_count']} шт.)")
+        lines.append(f"Итого в холде: {u.b(h['total'])}")
+        return "\n".join(lines)
 
     def orders_text(self) -> str:
         items, _ = self.hub.client.list_orders(limit=10)
@@ -332,17 +417,23 @@ class TGBot:
         to = date.today()
         a = self.hub.client.get_analytics(date_from=(to - timedelta(days=6)).isoformat(), date_to=to.isoformat(),
                                           sections="")
-        lines = [f"📊 <b>За 7 дней</b> ({a['period']['from']} — {a['period']['to']})"]
-        cur, prev = a.get("current", {}), a.get("previous", {})
+        period = a.get("period") or {}
+        lines = [f"📊 <b>За 7 дней</b> ({period.get('from', '?')} — {period.get('to', '?')})"]
+        labels = self._metric_labels()
+        cur, prev = a.get("current") or {}, a.get("previous") or {}
         for k, v in cur.items():
-            pv = prev.get(k)
-            if isinstance(v, dict):
-                val = f"{v['amount_minor'] / 100:,.2f} {v.get('currency', '')}".replace(",", " ")
-                pval = f"{pv['amount_minor'] / 100:,.2f}".replace(",", " ") if isinstance(pv, dict) else "—"
-            else:
-                val, pval = str(v), str(pv) if pv is not None else "—"
-            lines.append(f"• {escape(k)}: {u.b(val)} (было {escape(pval)})")
+            lines.append(f"• {escape(labels.get(k, k))}: {u.b(_fmt_metric(v, k))} "
+                         f"(было {escape(_fmt_metric(prev.get(k), k))})")
         return "\n".join(lines)
+
+    def _metric_labels(self) -> dict[str, str]:
+        if not getattr(self, "_labels", None):
+            try:
+                cat = self.hub.client.get_analytics_metrics()
+                self._labels = {m["key"]: m.get("label") or m["key"] for m in cat.get("metrics", [])}
+            except (IziAPIError, NetworkError, KeyError, TypeError):
+                return {}
+        return self._labels
 
     # ------------------------------------------------------------------ обработчики
 
@@ -361,6 +452,16 @@ class TGBot:
         bot.message_handler(commands=["orders"])(self._guard(lambda m: self.send(m.chat.id, self.orders_text())))
         bot.message_handler(commands=["stats"])(self._guard(lambda m: self.send(m.chat.id, self.stats_text())))
         bot.message_handler(commands=["about"])(self._guard(lambda m: self.send(m.chat.id, self.about_text())))
+
+        @bot.message_handler(commands=["update"])
+        @self._guard
+        def update_cmd(m: Message):
+            self.send(m.chat.id, *self.update_view())
+
+        @bot.message_handler(commands=["restart"])
+        @self._guard
+        def restart_cmd(m: Message):
+            self._restart(m.chat.id, "🔁 Перезапускаюсь…")
 
         @bot.message_handler(commands=["logs"])
         @self._guard
@@ -486,8 +587,10 @@ class TGBot:
         cmd, _, arg = c.data.partition(":")
         hub = self.hub
 
+        if cmd == "noop":
+            return self.bot.answer_callback_query(c.id)
         if cmd == "menu":
-            return self._edit(c, "📋 <b>Меню IziMarketHub</b>", self.main_menu())
+            return self._edit(c, "📋 <b>Меню IziMarketHub</b>", self.main_menu(int(arg or 0)))
         if cmd == "sw":
             return self._edit(c, *self.switches_view())
         if cmd == "swt":
@@ -588,8 +691,18 @@ class TGBot:
         if cmd == "pladd":
             self.bot.answer_callback_query(c.id)
             return self._ask(chat_id, "pladd", "", "🧩 Отправьте .py файл плагина")
+        if cmd == "upd":
+            self._edit(c, "🔄 Проверяю обновления…")
+            return self._edit(c, *self.update_view())
+        if cmd == "updgo":
+            self._edit(c, "⏳ Обновляюсь…")
+            commits = updater.update()
+            if not commits:
+                return self._edit(c, "✅ Уже последняя версия", self._back(section="upd"))
+            self._edit(c, f"✅ Обновлено ({len(commits)} изм.)")
+            return self._restart(chat_id, "🔁 Перезапускаюсь на новую версию…")
         if cmd == "about":
-            return self._edit(c, self.about_text(), self._back())
+            return self._edit(c, self.about_text(), self._back(section="about"))
         self.bot.answer_callback_query(c.id, "Неизвестная кнопка")
 
     # ------------------------------------------------------------------ запуск
@@ -600,6 +713,7 @@ class TGBot:
                 BotCommand("menu", "Меню"), BotCommand("orders", "Последние сделки"),
                 BotCommand("balance", "Баланс"), BotCommand("stats", "Статистика за 7 дней"),
                 BotCommand("deliver", "Выдать сделку вручную"), BotCommand("logs", "Файл логов"),
+                BotCommand("update", "Обновить бота из GitHub"), BotCommand("restart", "Перезапустить"),
                 BotCommand("about", "О боте"), BotCommand("cancel", "Отменить ввод"),
             ])
             me = self.bot.get_me()
@@ -611,4 +725,9 @@ class TGBot:
                          name="telegram", daemon=True).start()
         if not self.chats:
             logger.warning(f"Напишите боту @{me.username} и отправьте пароль, чтобы получать уведомления")
+        from hub import VERSION
+        chat = self.hub.store.get("restart_notify")
+        if chat:
+            self.hub.store.set("restart_notify", None)
+            self.send(chat, f"✅ IziMarketHub v{VERSION} перезапущен")
         self.notify_system("✅ IziMarketHub запущен")

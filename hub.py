@@ -12,7 +12,8 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from IziAPI import Client, Order, Product
+from IziAPI import Client, Money, Order, Product
+from IziAPI.types import parse_dt
 from IziAPI.exceptions import InvalidKeyError, IziAPIError, NetworkError
 from Utils import config_loader as cfg_loader
 from Utils.storage import GoodsStorage, JSONStore
@@ -274,6 +275,42 @@ class IziMarketHub:
         logger.info(f"Сделка #{order.id[:8]} выдана{' автоматически' if by_bot else ''}")
         self.dispatch("ORDER_DELIVERED", new, content or "", by_bot)
         return new
+
+    def sales_on_hold(self, payout_window_days: int = 60) -> dict:
+        """Деньги продаж, которые ещё не дошли до кошелька. API баланса их не отдаёт — считаем по сделкам.
+
+        in_deals — сделки не закрыты (оплачены, выданы, спор); awaiting — завершены, выплаты ещё не было;
+        held — из awaiting те, выплату которых задержала площадка (payout_held).
+        """
+        in_deals = awaiting = held = 0
+        in_deals_n = awaiting_n = held_n = 0
+        nearest = None
+        currency = "RUB"
+        for status in ("paid", "delivered", "disputed"):
+            for o in self.client.iter_orders(status=status, max_pages=20):
+                if o.seller_amount:
+                    in_deals += o.seller_amount.amount_minor
+                    currency = o.seller_amount.currency
+                in_deals_n += 1
+        since = (_now() - timedelta(days=payout_window_days)).date().isoformat()
+        for o in self.client.iter_orders(status="completed", created_from=since, max_pages=20):
+            if o.raw.get("paid_out_at"):
+                continue
+            amount = o.seller_amount.amount_minor if o.seller_amount else 0
+            awaiting += amount
+            awaiting_n += 1
+            if o.raw.get("payout_held"):
+                held += amount
+                held_n += 1
+            due = parse_dt(o.raw.get("payout_due_at"))
+            if due and (nearest is None or due < nearest):
+                nearest = due
+        return {
+            "in_deals": Money(in_deals, currency), "in_deals_count": in_deals_n,
+            "awaiting": Money(awaiting, currency), "awaiting_count": awaiting_n,
+            "held": Money(held, currency), "held_count": held_n,
+            "total": Money(in_deals + awaiting, currency), "nearest_payout": nearest,
+        }
 
     def poll_orders(self) -> int:
         """Опрос «хотя бы один раз»: с наибольшего updated_at минус минута, повторы — по статусу."""
