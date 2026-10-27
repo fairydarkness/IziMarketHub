@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import getpass
 import os
 
 from IziAPI import Client
@@ -31,9 +30,9 @@ AD_EXAMPLE = """\
 """
 
 
-def ask(prompt: str, default: str = "", secret: bool = False) -> str:
+def ask(prompt: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
-    value = (getpass.getpass if secret else input)(f"{prompt}{suffix}: ").strip()
+    value = input(f"{prompt}{suffix}: ").strip()
     return value or default
 
 
@@ -49,7 +48,7 @@ def run_setup() -> None:
     print("(для статистики и баланса — analytics:read, balance:read).\n")
 
     while True:
-        key = ask("Ключ API (izp_…)", secret=True)
+        key = ask("Ключ API (izp_…)")
         if not key.startswith("izp_"):
             print("Ключ должен начинаться с izp_")
             continue
@@ -73,7 +72,7 @@ def run_setup() -> None:
         cfg.set("Telegram", "enabled", "1")
         cfg.set("Telegram", "token", ask("Токен бота"))
         while True:
-            pwd = ask("Пароль доступа к боту (от 8 символов)", secret=True)
+            pwd = ask("Пароль доступа к боту (от 8 символов)")
             if len(pwd) >= 8:
                 break
             print("Слишком короткий")
@@ -82,7 +81,7 @@ def run_setup() -> None:
     if ask_bool("\nВключить приёмник вебхуков? (нужен https-адрес наружу; без него бот опрашивает API)", False):
         cfg.set("Webhook", "enabled", "1")
         cfg.set("Webhook", "port", ask("Порт", "8080"))
-        cfg.set("Webhook", "signingSecret", ask("Ключ подписи (izs_…)", secret=True))
+        cfg.set("Webhook", "signingSecret", ask("Ключ подписи (izs_…)"))
 
     cl.save_config(cfg, cl.MAIN_CFG)
     if not os.path.exists(cl.AD_CFG):
