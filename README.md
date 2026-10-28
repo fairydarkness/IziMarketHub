@@ -175,7 +175,7 @@ def on_new_order(hub, order):
 BIND_TO_NEW_ORDER = [on_new_order]
 ```
 
-События: `PRE_INIT`, `POST_INIT`, `PRE_START`, `POST_START`, `PRE_STOP`, `NEW_ORDER`, `ORDER_STATUS_CHANGED`,
+События: `PRE_INIT`, `POST_INIT`, `PRE_START`, `POST_START`, `PRE_STOP`, `NEW_ORDER`, `ORDER_STATUS_CHANGED`, `ORDER_PAYOUT_RELEASED`,
 `ORDER_DELIVERED`, `DELIVERY_FAILED`, `PRODUCT_DISABLED`, `PRODUCT_RESTORED`, `STOCK_REFILLED`, `WEBHOOK_EVENT`.
 Аргументы событий перечислены в `hub.py`. Внутри плагина доступны `hub.client` (весь API), `hub.goods`, `hub.store`, `hub.tg`.
 

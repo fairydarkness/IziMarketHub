@@ -341,3 +341,49 @@ def test_updater(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, "ROOT", str(tmp_path))
     with pytest.raises(updater.UpdateError, match="не git-репозиторий"):
         updater.check_ready()
+
+
+def test_old_order_payout_is_not_new_order(api, hub):
+    """Сделка куплена до запуска бота; бот видит её впервые, когда деньги выходят из холда."""
+    from datetime import datetime, timedelta, timezone
+    hub.add_handler("ORDER_PAYOUT_RELEASED", lambda h, o: h.events.append(("ORDER_PAYOUT_RELEASED", (o,))))
+    api.add_product(P_MANUAL, "Claude Pro")
+    hub.poll_orders()
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).replace(microsecond=0).isoformat()
+
+    def stamp(oid, **kw):
+        api.orders[oid].update(updated_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat(), **kw)
+
+    # 1. старая завершённая сделка, деньги вышли из холда — не «новая сделка» и без ложной выплаты
+    api.add_order("old", P_MANUAL, status="completed", username="RaysMorgan")
+    api.orders["old"].update(created_at=week_ago, paid_out_at=None)
+    stamp("old", paid_out_at=datetime.now(timezone.utc).isoformat())
+    hub.poll_orders()
+    assert hub.events == []
+    assert hub.known_status("old") == "completed"
+
+    # 2. сделка, которую бот видел в холде: выход из холда — отдельное событие, не смена статуса
+    api.add_order("seen", P_MANUAL, status="completed")
+    api.orders["seen"]["paid_out_at"] = None
+    hub.poll_orders()
+    assert [e for e, _ in hub.events] == ["NEW_ORDER"]
+    stamp("seen", paid_out_at=datetime.now(timezone.utc).isoformat())
+    hub.poll_orders()
+    assert [e for e, _ in hub.events] == ["NEW_ORDER", "ORDER_PAYOUT_RELEASED"]
+    hub.poll_orders()  # повтор опроса — без повторного события
+    assert len(hub.events) == 2
+
+    # 3. старая, но ещё не выданная сделка — новая: её надо выдать
+    hub.events.clear()
+    api.add_order("old_paid", P_MANUAL, status="paid")
+    api.orders["old_paid"]["created_at"] = week_ago
+    hub.poll_orders()
+    assert "NEW_ORDER" in [e for e, _ in hub.events]
+
+    # 4. запись старой версии бота [статус, время] без признака выплаты — без ложного события
+    hub.events.clear()
+    hub.store.update("orders", lambda o: {**o, "legacy": ["completed", week_ago]})
+    api.add_order("legacy", P_MANUAL, status="completed")
+    stamp("legacy", paid_out_at=datetime.now(timezone.utc).isoformat())
+    hub.poll_orders()
+    assert hub.events == []

@@ -31,6 +31,7 @@ NOTIFY_KINDS = {
     "new_order": "🛒 Новые сделки",
     "delivery": "📬 Выдача",
     "status": "🔄 Смена статуса",
+    "payout": "💸 Выход из холда",
     "stock": "📦 Склад и товары",
     "system": "⚙️ Системные",
 }
@@ -170,6 +171,10 @@ class TGBot:
         self.notify("status", f"{icon} Сделка {u.code('#' + order.id[:8])} «{escape(order.product_title or '')}»: "
                               f"{escape(old)} → {u.b(order.status_ru)}")
 
+    def on_payout(self, hub, order: Order) -> None:
+        self.notify("payout", f"💸 Деньги по сделке {u.code('#' + order.id[:8])} вышли из холда: "
+                              f"{u.b(order.seller_amount)}\n«{escape(order.product_title or '')}»")
+
     def on_delivered(self, hub, order: Order, content: str, by_bot: bool) -> None:
         who = "автоматически" if by_bot else "вручную"
         self.notify("delivery", f"📬 Сделка {u.code('#' + order.id[:8])} выдана {who}\n"
@@ -201,6 +206,7 @@ class TGBot:
         h = self.hub.add_handler
         h("NEW_ORDER", self.on_new_order)
         h("ORDER_STATUS_CHANGED", self.on_status)
+        h("ORDER_PAYOUT_RELEASED", self.on_payout)
         h("ORDER_DELIVERED", self.on_delivered)
         h("DELIVERY_FAILED", self.on_delivery_failed)
         h("PRODUCT_DISABLED", self.on_product_disabled)

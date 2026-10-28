@@ -36,6 +36,7 @@ EVENTS = [
     "PRE_STOP",                # (hub)
     "NEW_ORDER",               # (hub, order: Order)
     "ORDER_STATUS_CHANGED",    # (hub, order: Order, old_status: str)
+    "ORDER_PAYOUT_RELEASED",   # (hub, order: Order) — деньги по сделке вышли из холда
     "ORDER_DELIVERED",         # (hub, order: Order, content: str, by_bot: bool)
     "DELIVERY_FAILED",         # (hub, order: Order, reason: str)
     "PRODUCT_DISABLED",        # (hub, product: Product, reason: str)
@@ -86,6 +87,12 @@ class IziMarketHub:
         self._wake_refill = threading.Event()
         self._products_cache: dict[str, tuple[float, Product]] = {}
         self._title_map: tuple[float, dict[str, str]] = (0, {})
+        # с какого момента бот следит за сделками: созданные раньше — не «новые»
+        since = self.store.get("tracking_since")
+        if not since:
+            since = _now().replace(microsecond=0).isoformat()
+            self.store.set("tracking_since", since)
+        self.tracking_since = datetime.fromisoformat(since)
 
     # ------------------------------------------------------------------ настройки
 
@@ -246,25 +253,47 @@ class IziMarketHub:
 
     def mark_order(self, order: Order) -> None:
         stamp = order.updated_at.isoformat() if order.updated_at else _now().isoformat()
-        self.store.update("orders", lambda old: {**(old or {}), order.id: [order.status, stamp]})
+        rec = [order.status, stamp, bool(order.raw.get("paid_out_at"))]
+        self.store.update("orders", lambda old: {**(old or {}), order.id: rec})
 
     def known_status(self, order_id: str) -> str | None:
         rec = (self.store.get("orders") or {}).get(order_id)
         return rec[0] if rec else None
 
+    def _known_paid_out(self, order_id: str) -> bool | None:
+        rec = (self.store.get("orders") or {}).get(order_id)
+        # записи старых версий бота — без признака выплаты
+        return rec[2] if rec and len(rec) > 2 else None
+
+    def is_new_order(self, order: Order) -> bool:
+        """Незнакомая сделка — новая, если её создали при боте или её ещё надо выдать."""
+        return order.status == "paid" or not order.created_at or order.created_at >= self.tracking_since
+
     def process_order(self, order: Order) -> None:
+        paid_out = bool(order.raw.get("paid_out_at"))
         with self._orders_lock:
             old = self.known_status(order.id)
-            if old == order.status:
+            old_paid_out = self._known_paid_out(order.id)
+            if old == order.status and old_paid_out == paid_out:
                 return
             self.mark_order(order)
+
         if old is None:
+            if not self.is_new_order(order):
+                # сделка старше бота: например, по ней только что пришла выплата — это не продажа
+                logger.debug(f"Сделка #{order.id[:8]} создана до запуска бота ({order.status}) — запомнена")
+                return
             logger.info(f"Новая сделка #{order.id[:8]}: «{order.product_title}» x{order.quantity}, "
                         f"{order.amount}, покупатель {order.buyer.username} ({order.status_ru})")
             self.dispatch("NEW_ORDER", order)
-        else:
+            return
+
+        if old != order.status:
             logger.info(f"Сделка #{order.id[:8]}: {old} → {order.status}")
             self.dispatch("ORDER_STATUS_CHANGED", order, old)
+        if paid_out and old_paid_out is False:
+            logger.info(f"Сделка #{order.id[:8]}: деньги вышли из холда, {order.seller_amount}")
+            self.dispatch("ORDER_PAYOUT_RELEASED", order)
 
     def deliver(self, order: Order, content: str | None, fields: dict | None = None,
                 by_bot: bool = False) -> Order:
