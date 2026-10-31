@@ -537,3 +537,84 @@ def test_tg_chats(api, hub, monkeypatch):
     click("are:0")
     click("art:0:telegramNotification")
     assert hub.AR_CFG.get("!цена", "telegramNotification") == "1"
+
+
+def test_chat_templates_missing_vars_and_commands():
+    from IziAPI import Chat, ChatMessage
+    from hub import parse_send_commands
+    from Utils.templates import format_chat_text
+    direct = Chat.from_dict({"id": "c", "type": "direct", "counterpart": {"username": "kiwi"}})
+    order = Chat.from_dict({"id": "c", "type": "order", "counterpart": {"username": "kiwi"},
+                            "order": {"id": "o1", "title": "Robux"}})
+    tpl = "Привет!\\n$username, $order_title, $order_id"
+    assert format_chat_text(tpl, direct) == "Привет!\nkiwi, , "
+    assert format_chat_text(tpl, order) == "Привет!\nkiwi, Robux, o1"
+    # текст сообщения с «переменной» не раскрывается
+    msg = ChatMessage.from_dict({"id": "m", "text": "$username"})
+    assert format_chat_text("Вы написали: $message_text", direct, msg) == "Вы написали: $username"
+    o = Order.from_dict({"id": "o", "buyer": {"username": "k", "inputs": {}}})
+    assert format_text("Ключ: $product\nНик: $input_nick", o, ["A"]) == "Ключ: A\nНик: "
+    assert parse_send_commands("Привет$sleep=1,5Как дела?\n$photo=a.png") == [
+        ("text", "Привет"), ("sleep", 1.5), ("text", "Как дела?\n"), ("photo", "a.png")]
+
+
+def test_greetings_only_first_contact_and_watermark(api, hub):
+    hub.MAIN_CFG.set("Chat", "greetings", "1")
+    hub.MAIN_CFG.set("Other", "watermark", "🤖 IziMarketHub")
+    api.add_chat(C1)
+    hub.init_chats()
+    # чат существовал до бота: давно молчал, но «только впервые» — не здороваемся
+    api.chats[C1]["created_at"] = "2026-01-01T00:00:00+00:00"
+    api.add_message(C1, "снова я")
+    hub.poll_chats()
+    assert [m for m in api.messages[C1] if m["author"] == "me"] == []
+
+    # старый чат, который бот не видел: создан давно — тоже не первый контакт
+    api.add_chat(C2, username="old")
+    api.chats[C2]["created_at"] = "2026-01-01T00:00:00+00:00"
+    api.add_message(C2, "привет")
+    hub.poll_chats()
+    assert [m for m in api.messages[C2] if m["author"] == "me"] == []
+
+    C3 = "c3333333-3333-4333-8333-333333333333"
+    api.add_chat(C3, username="new")
+    api.add_message(C3, "привет")
+    hub.poll_chats()
+    mine = [m["text"] for m in api.messages[C3] if m["author"] == "me"]
+    assert mine == ["🤖 IziMarketHub\nЗдравствуйте, new! Скоро отвечу."]
+
+
+def test_tg_order_chat_and_configs(api, hub, monkeypatch):
+    from types import SimpleNamespace
+    from tg_bot.bot import TGBot
+    hub.MAIN_CFG.set("Telegram", "token", "123:fake")
+    tg = TGBot(hub)
+    tg._authorize(1)
+    shown, docs = [], []
+    monkeypatch.setattr(tg, "_edit", lambda c, text, kb=None: shown.append((c.data, text, kb)))
+    monkeypatch.setattr(tg, "send", lambda chat, text, markup=None: shown.append(("send", text, markup)))
+    monkeypatch.setattr(tg.bot, "answer_callback_query", lambda *a, **k: None)
+    monkeypatch.setattr(tg.bot, "send_document", lambda chat, f, **k: docs.append(k["visible_file_name"]))
+
+    def click(data):
+        tg._callback(SimpleNamespace(id="1", data=data, message=SimpleNamespace(chat=SimpleNamespace(id=1),
+                                                                              message_id=1)))
+
+    api.add_product(P_MANUAL, "Ключ")
+    api.add_order("o1", P_MANUAL)
+    api.add_chat(C1, order_id="o1")
+    order = hub.client.get_order("o1")
+    assert "ocr:o1" in [b.callback_data for row in tg._order_markup(order).keyboard for b in row]
+    click("ocr:o1")
+    tg._handle_pending(SimpleNamespace(chat=SimpleNamespace(id=1), text="Привет$sleep=0Ещё"))
+    assert [m["text"] for m in api.messages[C1]] == ["Привет", "Ещё"]
+
+    click("cfg")
+    click("cfgget:ar")
+    tg._upload_config(1, "ar", "[!цена]\nresponse = 100\n".encode())
+    assert hub.AR_CFG.get("!цена", "response") == "100"
+    tg._upload_config(1, "ar", b"[x]\nbad = 1\n")
+    assert "не принят" in shown[-1][1] and hub.AR_CFG.has_section("!цена")
+    click("chs")
+    click("cst:greetingsNewOnly")
+    assert hub.chat_setting("greetingsNewOnly") is False

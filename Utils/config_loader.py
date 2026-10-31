@@ -40,6 +40,7 @@ MAIN_SCHEMA: dict[str, dict[str, tuple[str, str]]] = {
         "autoResponse": ("1", "bool"),
         "greetings": ("0", "bool"),
         "greetingsText": ("Здравствуйте, $username! Скоро отвечу.", "str"),
+        "greetingsNewOnly": ("1", "bool"),
         "greetingsCooldown": ("2", "int:0"),
         "greetingsOrderChats": ("0", "bool"),
         "newOrderReply": ("0", "bool"),

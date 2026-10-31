@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("IMH")
 
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 AUTHOR = "@fairydarkns"
 AUTHOR_LINK = "https://t.me/fairydarkns"
 
@@ -435,6 +436,31 @@ class IziMarketHub:
         self.dispatch("MESSAGE_SENT", chat_id, msg, by_bot)
         return msg
 
+    def send_text(self, chat_id: str, text: str, by_bot: bool = True) -> list[ChatMessage]:
+        """Отправить текст с командами, как в FunPay Cardinal:
+
+        ``$sleep=N`` — разбить на несколько сообщений с паузой N секунд;
+        ``$photo=имя.png`` — отправить картинку из storage/images (только в чатах заказов).
+        Автоматическим сообщениям в начало добавляется [Other] watermark.
+        Бросает IziAPIError/NetworkError — решать вызывающему."""
+        sent: list[ChatMessage] = []
+        watermark = self.MAIN_CFG.get("Other", "watermark").replace("\\n", "\n").strip() if by_bot else ""
+        for kind, value in parse_send_commands(text):
+            if kind == "sleep":
+                time.sleep(min(value, 60))
+            elif kind == "photo":
+                path = os.path.join(IMAGES_DIR, os.path.basename(value))
+                if not os.path.exists(path):
+                    logger.warning(f"$photo: нет файла {path}")
+                    continue
+                up = self.client.upload_chat_image(path)
+                sent.append(self.send_message(chat_id, "\ufffc", images=[up["id"]], by_bot=by_bot))
+            elif value.strip():
+                if watermark:
+                    value, watermark = f"{watermark}\n{value}", ""
+                sent.append(self.send_message(chat_id, value.strip(), by_bot=by_bot))
+        return sent
+
     def is_bot_message(self, message: ChatMessage) -> bool:
         return bool(message.client_message_id) and message.client_message_id in self._sent_by_bot
 
@@ -651,6 +677,27 @@ class IziMarketHub:
         self._wake_orders.set()
         self._wake_refill.set()
         self._wake_chats.set()
+
+
+IMAGES_DIR = os.path.join("storage", "images")
+_SEND_CMD_RE = re.compile(r"\$sleep=(\d+(?:[.,]\d+)?)|\$photo=(\S+)")
+
+
+def parse_send_commands(text: str) -> list[tuple[str, Any]]:
+    """«Привет$sleep=2Как дела?$photo=a.png» → [(text, Привет), (sleep, 2.0), (text, Как дела?), (photo, a.png)]."""
+    out: list[tuple[str, Any]] = []
+    pos = 0
+    for m in _SEND_CMD_RE.finditer(text):
+        if m.start() > pos:
+            out.append(("text", text[pos:m.start()]))
+        if m.group(1):
+            out.append(("sleep", float(m.group(1).replace(",", "."))))
+        else:
+            out.append(("photo", m.group(2)))
+        pos = m.end()
+    if pos < len(text):
+        out.append(("text", text[pos:]))
+    return out
 
 
 def _now() -> datetime:

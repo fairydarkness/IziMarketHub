@@ -62,13 +62,15 @@ MENU_PAGES = [
      ("👋 Сообщения бота", "chs"), ("🚫 Чёрный список", "bl"),
      ("📊 Статистика", "stats"), ("⚙️ Переключатели", "sw")],
     [("🔔 Уведомления", "nt"), ("🧩 Плагины", "pl"),
-     ("🔄 Обновление", "upd"), ("ℹ️ О боте", "about")],
+     ("📂 Конфиги", "cfg"), ("🔄 Обновление", "upd"),
+     ("ℹ️ О боте", "about")],
 ]
 
 # переключатели и тексты сообщений, которые бот сам пишет в чаты: [Chat] в _main.cfg
 CHAT_SWITCHES = {
     "autoResponse": "Автоответчик",
     "greetings": "Приветствие новых собеседников",
+    "greetingsNewOnly": "…только тем, кто пишет впервые",
     "greetingsOrderChats": "…и в чатах заказов",
     "newOrderReply": "Сообщение при новом заказе",
     "orderConfirmReply": "Сообщение при подтверждении",
@@ -85,8 +87,16 @@ BLACKLIST_SWITCHES = {
     "blockResponse": "Не отвечать автоматически",
     "blockNotifications": "Не присылать уведомления",
 }
-CHAT_VARS = "$username, $order_title, $order_id, $message_text, $date, $time"
-ORDER_VARS = "$username, $product_title, $order_id, $quantity, $amount, $date, $time"
+CHAT_VARS = ("$username, $order_title, $order_id, $order_link, $message_text, $date, $time, $full_date. "
+             "Переменная, которой нет (заказ в личном чате), будет пустой. "
+             "$sleep=2 — пауза и новое сообщение, $photo=имя.png — картинка из storage/images")
+ORDER_VARS = ("$username, $product_title, $order_id, $order_link, $quantity, $amount, $date, $time, $full_date. "
+              "$sleep=2 — пауза и новое сообщение, $photo=имя.png — картинка из storage/images")
+# что можно скачать и загрузить в «📂 Конфиги»: ключ → (файл, загрузчик-проверка, атрибут ядра)
+CONFIG_FILES = {
+    "ad": ("auto_delivery.cfg", "load_auto_delivery_config", "AD_CFG"),
+    "ar": ("auto_response.cfg", "load_auto_response_config", "AR_CFG"),
+}
 # «Назад» из раздела возвращает на ту страницу меню, где он лежит
 MENU_PAGE_OF = {cb.split(":")[0]: i for i, page in enumerate(MENU_PAGES) for _, cb in page}
 
@@ -201,6 +211,9 @@ class TGBot:
         kb = InlineKeyboardMarkup()
         if order.status == "paid":
             kb.add(Btn("✍️ Выдать вручную", callback_data=f"deliver:{order.id}"))
+        if self.hub.chats_available:
+            kb.add(Btn("✉️ Написать покупателю", callback_data=f"ocr:{order.id}"),
+                   Btn("📜 Чат", callback_data=f"och:{order.id}"))
         if order.product_id:
             kb.add(Btn("🔗 Товар на сайте", url=f"https://izi.market/products/{order.product_id}"))
         return kb
@@ -253,13 +266,9 @@ class TGBot:
         shown = [m for m in messages if not m.by_me or own]
         if not shown:
             return
-        lines = [u.chat_title(chat)]
-        for m in shown[-10:]:
-            body = u.message_body(m)
-            lines.append(body if m.by_counterpart and len(shown) == 1 else f"{u.author_label(chat, m)}: {body}")
+        lines = [u.notify_line(chat, m) for m in shown[-10:]]
         if len(shown) > 10:
-            lines.insert(1, f"<i>…и ещё {len(shown) - 10} раньше</i>")
-        lines.append("\n<i>Ответьте на это сообщение, чтобы написать собеседнику</i>")
+            lines.insert(0, f"<i>…и ещё {len(shown) - 10} раньше</i>")
         self.notify("message", "\n".join(lines), self._chat_markup(chat), izi_chat=chat.id)
 
     def on_command(self, chat: Chat, msg: ChatMessage, command: str, text: str) -> None:
@@ -542,10 +551,16 @@ class TGBot:
         for key, title in CHAT_SWITCHES.items():
             kb.add(Btn(f"{_onoff(self.hub.chat_setting(key))} {title}", callback_data=f"cst:{key}"))
         kb.row(*(Btn(f"✏️ {title}", callback_data=f"csx:{key}") for key, title in CHAT_TEXTS.items()))
+        kb.row(Btn("💧 Водяной знак", callback_data="csx:watermark"),
+               Btn(f"⏱ Кулдаун: {c.get('greetingsCooldown')} дн.", callback_data="csx:greetingsCooldown"))
+        who = "тем, кто пишет впервые" if self.hub.chat_setting("greetingsNewOnly") else \
+            f"новым и молчавшим {c.get('greetingsCooldown')} дн."
+        watermark = self.hub.MAIN_CFG.get("Other", "watermark")
         text = ("👋 <b>Сообщения, которые бот пишет сам</b>\n\n"
-                f"Приветствие (раз в {c.get('greetingsCooldown')} дн.):\n<code>{escape(c.get('greetingsText'))}</code>\n\n"
+                f"Приветствие ({who}):\n<code>{escape(c.get('greetingsText'))}</code>\n\n"
                 f"Новый заказ:\n<code>{escape(c.get('newOrderReplyText'))}</code>\n\n"
-                f"Подтверждение заказа:\n<code>{escape(c.get('orderConfirmReplyText'))}</code>")
+                f"Подтверждение заказа:\n<code>{escape(c.get('orderConfirmReplyText'))}</code>\n\n"
+                f"Водяной знак: {u.code(watermark) if watermark else '—'}")
         if not self.hub.chats_available:
             text += "\n\n⚠️ У ключа API нет прав на чаты — сообщения не отправляются."
         return text, self._back(kb, section="chs")
@@ -713,10 +728,12 @@ class TGBot:
         @self._guard
         def document(m: Message):
             action, arg = self._pending.pop(m.chat.id, (None, None))
-            if action not in ("gadd", "pladd"):
+            if action not in ("gadd", "pladd", "cfgup"):
                 return self.send(m.chat.id, "Файл не ожидался. Откройте нужный пункт меню и нажмите «Добавить».")
             data = bot.download_file(bot.get_file(m.document.file_id).file_path)
-            if action == "gadd":
+            if action == "cfgup":
+                self._upload_config(m.chat.id, arg, data)
+            elif action == "gadd":
                 self._add_goods(m.chat.id, arg, data.decode("utf-8", "replace").splitlines())
             else:
                 self._save_plugin(m.chat.id, m.document.file_name, data)
@@ -782,7 +799,10 @@ class TGBot:
 
     def _send_to_chat(self, tg_chat: int, izi_chat: str, text: str, images: list[str] | None = None) -> None:
         try:
-            self.hub.send_message(izi_chat, text, images=images, by_bot=False)
+            if images:
+                self.hub.send_message(izi_chat, text, images=images, by_bot=False)
+            else:
+                self.hub.send_text(izi_chat, text, by_bot=False)
         except IziAPIError as e:
             return self.send(tg_chat, f"❌ Не отправлено: {escape(e.message or str(e))}"
                                       + (f" ({u.code(e.code)})" if e.code else ""))
@@ -830,7 +850,13 @@ class TGBot:
             self.hub.save_ar_config()
             self.send(m.chat.id, *self.ar_edit_view(int(arg)))
         elif action == "csx":
-            self.hub.MAIN_CFG.set("Chat", arg, txt.replace("\n", "\\n"))
+            section = "Other" if arg == "watermark" else "Chat"
+            value = "" if arg == "watermark" and txt.strip() == "-" else txt.replace("\n", "\\n")
+            if arg == "greetingsCooldown":
+                if not value.strip().isdigit():
+                    return self.send(m.chat.id, "Нужно целое число дней")
+                value = value.strip()
+            self.hub.MAIN_CFG.set(section, arg, value)
             self.hub.save_main_config()
             self.send(m.chat.id, *self.chat_settings_view())
         elif action == "bla":
@@ -861,6 +887,32 @@ class TGBot:
         n = self.hub.goods.add(file_name, lines)
         self.send(chat_id, f"✅ Добавлено {n} строк в {u.code(file_name)}, всего {self.hub.goods.count(file_name)}")
         self.hub.wake(refill=True)
+
+    def _upload_config(self, chat_id: int, key: str, data: bytes) -> None:
+        from Utils import config_loader as cl
+        name, loader, attr = CONFIG_FILES[key]
+        path = os.path.join(cl.CONFIG_DIR, name)
+        tmp = path + ".upload"
+        os.makedirs(cl.CONFIG_DIR, exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(data)
+        try:
+            cfg = getattr(cl, loader)(tmp)
+        except Exception as e:  # ConfigError или битый INI
+            os.remove(tmp)
+            return self.send(chat_id, f"❌ Конфиг не принят: {escape(str(e))}")
+        os.replace(tmp, path)
+        setattr(self.hub, attr, cfg)
+        logger.warning(f"Через Telegram загружен {name}")
+        self.send(chat_id, f"✅ {u.code(name)} загружен и применён: {len(cfg.sections())} секций")
+
+    def configs_view(self) -> tuple[str, InlineKeyboardMarkup]:
+        kb = InlineKeyboardMarkup(row_width=2)
+        for key, (name, _, _) in CONFIG_FILES.items():
+            kb.add(Btn(f"📤 {name}", callback_data=f"cfgget:{key}"), Btn("📥 Загрузить", callback_data=f"cfgup:{key}"))
+        text = ("📂 <b>Конфиги</b>\nСкачайте файл, поправьте и загрузите обратно — бот проверит его "
+                "и применит без перезапуска.")
+        return text, self._back(kb, section="cfg")
 
     def _save_plugin(self, chat_id: int, name: str, data: bytes) -> None:
         name = os.path.basename(name or "")
@@ -1034,11 +1086,45 @@ class TGBot:
             return self._edit(c, *self.ar_view(0))
         if cmd == "chs":
             return self._edit(c, *self.chat_settings_view())
+        if cmd in ("ocr", "och"):
+            chat = hub.client.find_order_chat(arg)
+            if not chat:
+                return self.bot.answer_callback_query(c.id, "Чата по этой сделке пока нет", show_alert=True)
+            if cmd == "och":
+                self.bot.answer_callback_query(c.id)
+                text, kb = self.chat_view(chat.id)
+                msg = self.send(chat_id, text, kb)
+                if msg:
+                    self._remember_reply(msg, chat.id)
+                return
+            self.bot.answer_callback_query(c.id)
+            return self._ask(chat_id, "chr", chat.id, f"✉️ Сообщение покупателю {u.b(chat.username)} — "
+                                                      "текст или картинка")
+        if cmd == "cfg":
+            return self._edit(c, *self.configs_view())
+        if cmd == "cfgget":
+            from Utils import config_loader as cl
+            self.bot.answer_callback_query(c.id)
+            path = os.path.join(cl.CONFIG_DIR, CONFIG_FILES[arg][0])
+            if not os.path.exists(path):
+                return self.send(chat_id, f"Файла {u.code(CONFIG_FILES[arg][0])} ещё нет")
+            with open(path, "rb") as f:
+                self.bot.send_document(chat_id, f, visible_file_name=CONFIG_FILES[arg][0])
+            return
+        if cmd == "cfgup":
+            self.bot.answer_callback_query(c.id)
+            return self._ask(chat_id, "cfgup", arg, f"📥 Отправьте файл {u.code(CONFIG_FILES[arg][0])}")
         if cmd == "cst":
             hub.toggle_setting("Chat", arg)
             return self._edit(c, *self.chat_settings_view())
         if cmd == "csx":
             self.bot.answer_callback_query(c.id)
+            if arg == "watermark":
+                return self._ask(chat_id, "csx", arg, "✏️ Отправьте водяной знак — он встанет первой строкой "
+                                                      "в автоматических сообщениях. «-» — убрать")
+            if arg == "greetingsCooldown":
+                return self._ask(chat_id, "csx", arg, "⏱ Через сколько дней тишины здороваться снова "
+                                                      "(работает, если выключено «только тем, кто пишет впервые»)")
             variables = CHAT_VARS if arg == "greetingsText" else ORDER_VARS
             return self._ask(chat_id, "csx", arg, f"✏️ Отправьте новый текст. Переменные: {variables}")
         if cmd == "bl":

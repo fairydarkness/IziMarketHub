@@ -96,3 +96,28 @@ def message_body(msg: ChatMessage, limit: int = 1500) -> str:
 def chat_title(chat: Chat) -> str:
     where = f" · заказ «{escape((chat.order_title or '')[:40])}»" if chat.type == "order" else ""
     return f"💬 {b(chat.username)}{where}"
+
+
+def notify_line(chat: Chat, msg: ChatMessage) -> str:
+    """Строка уведомления: «👤 ник: текст» — ник жирным курсивом, текст моноширинным."""
+    if msg.by_me:
+        who = "🫵 Вы"
+    elif msg.by_counterpart:
+        who = f"👤 {chat.username}"
+    elif msg.by_staff:
+        who = f"🛡 {msg.raw.get('staff_role') or 'Поддержка'}"
+    else:
+        who = "ℹ️ Система"
+    head = f"<i><b>{escape(who)}:</b></i>"
+    if msg.deleted:
+        return f"{head} <i>сообщение удалено</i>"
+    if msg.withheld:
+        return f"{head} <i>сообщение скрыто (только арбитру)</i>"
+    text = msg.text.replace("\ufffc", "").strip()
+    parts = [f"<code>{escape(text[:1500])}</code>" if text else ""]
+    for i, img in enumerate(msg.images, 1):
+        url = img.get("url") if isinstance(img, dict) else img if isinstance(img, str) else None
+        parts.append(f'<a href="{escape(url)}">🖼 картинка {i}</a>' if url else "🖼 картинка")
+    if msg.raw.get("attachments"):
+        parts.append(f"📎 вложений: {len(msg.raw['attachments'])}")
+    return head + " " + " ".join(p for p in parts if p)

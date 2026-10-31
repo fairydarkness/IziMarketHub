@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from IziAPI import Chat, ChatMessage, Order, Product
+from IziAPI.types import parse_dt
 from IziAPI.exceptions import ConflictError, IziAPIError, NetworkError
 from Utils.config_loader import is_true
 from Utils.storage import unescape_item
@@ -230,12 +231,18 @@ def find_command(hub: IziMarketHub, text: str) -> str | None:
 
 
 def _send_safe(hub: IziMarketHub, chat_id: str, text: str, what: str) -> bool:
-    try:
-        hub.send_message(chat_id, text)
+    """Отправка с $sleep/$photo. Текст с паузами уходит в фоне, чтобы не держать опрос чатов."""
+    def run() -> bool:
+        try:
+            return bool(hub.send_text(chat_id, text))
+        except (IziAPIError, NetworkError) as e:
+            logger.warning(f"Чат {chat_id[:8]}: {what} не отправлено: {e}")
+            return False
+
+    if "$sleep=" in text:
+        threading.Thread(target=run, name=f"send-{chat_id[:8]}", daemon=True).start()
         return True
-    except (IziAPIError, NetworkError) as e:
-        logger.warning(f"Чат {chat_id[:8]}: {what} не отправлено: {e}")
-        return False
+    return run()
 
 
 def auto_response_handler(hub: IziMarketHub, chat: Chat, msg: ChatMessage) -> None:
@@ -260,8 +267,20 @@ def auto_response_handler(hub: IziMarketHub, chat: Chat, msg: ChatMessage) -> No
         hub.tg.on_command(chat, msg, section, s.get("notificationText") or "")
 
 
+def is_first_contact(chat: Chat, messages: list[ChatMessage], first: ChatMessage) -> bool:
+    """Собеседник пишет впервые: чат новый для бота, создан недавно, и до этого сообщения в нём
+    не было ничьих слов (бот видит чат впервые, значит, в messages вся его история)."""
+    if not chat.is_new:
+        return False
+    created = parse_dt(chat.raw.get("created_at"))
+    if created and (first.created_at or datetime.now(timezone.utc)) - created > timedelta(days=1):
+        return False
+    return not any((m.by_me or m.by_counterpart) for m in messages if m.seq < first.seq)
+
+
 def greetings_handler(hub: IziMarketHub, chat: Chat, messages: list[ChatMessage]) -> None:
-    """Приветствие: новому собеседнику или тому, кто не писал дольше greetingsCooldown дней."""
+    """Приветствие тому, кто пишет впервые; если greetingsNewOnly = 0 — ещё и тому,
+    кто не писал дольше greetingsCooldown дней."""
     if not hub.chat_setting("greetings") or not hub.chats_available:
         return
     if chat.type == "order" and not hub.chat_setting("greetingsOrderChats"):
@@ -276,15 +295,19 @@ def greetings_handler(hub: IziMarketHub, chat: Chat, messages: list[ChatMessage]
     cooldown = timedelta(days=hub.MAIN_CFG.getint("Chat", "greetingsCooldown"))
     now = datetime.now(timezone.utc)
     greeted = (hub.store.get("greeted") or {}).get(chat.id)
-    if greeted and now - datetime.fromisoformat(greeted) < cooldown:
-        return
-    if not chat.is_new:
-        prev = chat.prev_message_at
-        if prev is None or (first.created_at or now) - prev < cooldown:
+    if hub.chat_setting("greetingsNewOnly"):
+        if greeted or not is_first_contact(chat, messages, first):
             return
+    else:
+        if greeted and now - datetime.fromisoformat(greeted) < cooldown:
+            return
+        if not is_first_contact(chat, messages, first):
+            prev = chat.prev_message_at
+            if prev is None or (first.created_at or now) - prev < cooldown:
+                return
     text = hub.MAIN_CFG.get("Chat", "greetingsText")
     if text and _send_safe(hub, chat.id, format_chat_text(text, chat, first), "приветствие"):
-        hub.store.update("greeted", lambda old: _prune_dates({**(old or {}), chat.id: now.isoformat()}))
+        hub.store.update("greeted", lambda old: _prune_dates({**(old or {}), chat.id: now.isoformat()}, 400))
 
 
 def _prune_dates(d: dict, days: int = 60) -> dict:
