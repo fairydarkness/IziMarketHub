@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("IMH")
 
-VERSION = "0.1.0"
+VERSION = "0.0.3"
 AUTHOR = "@fairydarkns"
 AUTHOR_LINK = "https://t.me/fairydarkns"
 
