@@ -29,6 +29,26 @@ AD_EXAMPLE = """\
 # productsFileName = hades.txt
 """
 
+AR_EXAMPLE = """\
+# Автоответчик IziMarketHub.
+# Имя секции — команда, на которую отвечать (без учёта регистра). Несколько вариантов — через |.
+#
+# response              — ответ. Переменные: $username $order_title $order_id $message_text $date $time
+#                         Перенос строки — \\n
+# contains              — 1: срабатывать, если команда встречается внутри сообщения
+# disable               — 1: команда выключена
+# telegramNotification  — 1: прислать уведомление в Telegram
+# notificationText      — текст уведомления (по умолчанию «ник отправил команду …»)
+
+[!помощь|!help]
+response = $username, команды:\\n!продавец — позвать продавца
+
+[!продавец]
+response = $username, продавец получил уведомление и скоро ответит.
+telegramNotification = 1
+notificationText = $username зовёт вас в чат
+"""
+
 
 def ask(prompt: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
@@ -44,8 +64,9 @@ def ask_bool(prompt: str, default: bool) -> bool:
 def run_setup() -> None:
     print("=== Первичная настройка IziMarketHub (автор @fairydarkns) ===\n")
     print("Ключ API выпускается на izi.market → Настройки → API → Ключи.")
-    print("Нужные права: orders:read, orders:write, products:read, products:write, stock:read, stock:write")
-    print("(для статистики и баланса — analytics:read, balance:read).\n")
+    print("Нужные права: orders:read, orders:write, products:read, products:write, stock:read, stock:write,")
+    print("chats:read, chats:write (чаты и автоответчик; их надо отметить явно)")
+    print("и для статистики и баланса — analytics:read, balance:read.\n")
 
     while True:
         key = ask("Ключ API (izp_…)")
@@ -87,6 +108,9 @@ def run_setup() -> None:
     if not os.path.exists(cl.AD_CFG):
         with open(cl.AD_CFG, "w", encoding="utf-8") as f:
             f.write(AD_EXAMPLE)
+    if not os.path.exists(cl.AR_CFG):
+        with open(cl.AR_CFG, "w", encoding="utf-8") as f:
+            f.write(AR_EXAMPLE)
     try:
         os.chmod(cl.MAIN_CFG, 0o600)
     except OSError:

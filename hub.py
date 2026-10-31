@@ -1,4 +1,4 @@
-"""Ядро IziMarketHub: опрос сделок, события, плагины, фоновые задачи."""
+"""Ядро IziMarketHub: опрос сделок и чатов, события, плагины, фоновые задачи."""
 
 from __future__ import annotations
 
@@ -9,12 +9,14 @@ import sys
 import threading
 import time
 import traceback
+import uuid as uuid_lib
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from IziAPI import Client, Money, Order, Product
+from IziAPI import Chat, ChatMessage, Client, Money, Order, Product
 from IziAPI.types import parse_dt
-from IziAPI.exceptions import InvalidKeyError, IziAPIError, NetworkError
+from IziAPI.exceptions import InvalidKeyError, IziAPIError, NetworkError, ScopeMissingError
 from Utils import config_loader as cfg_loader
 from Utils.storage import GoodsStorage, JSONStore
 
@@ -23,7 +25,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("IMH")
 
-VERSION = "0.0.2"
+VERSION = "0.1.0"
 AUTHOR = "@fairydarkns"
 AUTHOR_LINK = "https://t.me/fairydarkns"
 
@@ -43,12 +45,18 @@ EVENTS = [
     "PRODUCT_RESTORED",        # (hub, product: Product)
     "STOCK_REFILLED",          # (hub, product: Product, added: int)
     "WEBHOOK_EVENT",           # (hub, event: WebhookEvent)
+    "NEW_MESSAGE",             # (hub, chat: Chat, message: ChatMessage) — каждое новое сообщение, кроме отправленных ботом
+    "NEW_MESSAGES",            # (hub, chat: Chat, messages: list[ChatMessage]) — пачка новых сообщений одного чата
+    "MESSAGE_SENT",            # (hub, chat_id: str, message: ChatMessage, by_bot: bool) — бот отправил сообщение
 ]
 
 REQUIRED_SCOPES = ["orders:read", "orders:write", "products:read", "products:write", "stock:read",
                    "stock:write"]
 
+CHAT_SCOPES = ["chats:read", "chats:write"]
+
 STATE_TTL = timedelta(days=14)
+MAX_KNOWN_CHATS = 5000
 
 
 class PluginData:
@@ -66,9 +74,10 @@ class PluginData:
 
 
 class IziMarketHub:
-    def __init__(self, main_cfg, ad_cfg):
+    def __init__(self, main_cfg, ad_cfg, ar_cfg=None):
         self.MAIN_CFG = main_cfg
         self.AD_CFG = ad_cfg
+        self.AR_CFG = ar_cfg if ar_cfg is not None else cfg_loader.load_auto_response_config()
         im = main_cfg["IziMarket"]
         self.client = Client(im["apiKey"], locale=im["locale"], proxy=im["proxy"] or None)
         self.store = JSONStore()
@@ -85,6 +94,11 @@ class IziMarketHub:
         self._orders_lock = threading.RLock()
         self._wake_orders = threading.Event()
         self._wake_refill = threading.Event()
+        self._wake_chats = threading.Event()
+        self._chats_lock = threading.RLock()
+        # client_message_id сообщений, которые отправил сам бот: их не считаем входящими
+        self._sent_by_bot: OrderedDict[str, None] = OrderedDict()
+        self.chats_available = True
         self._products_cache: dict[str, tuple[float, Product]] = {}
         self._title_map: tuple[float, dict[str, str]] = (0, {})
         # с какого момента бот следит за сделками: созданные раньше — не «новые»
@@ -110,6 +124,33 @@ class IziMarketHub:
 
     def save_ad_config(self) -> None:
         cfg_loader.save_config(self.AD_CFG, cfg_loader.AD_CFG)
+
+    def save_ar_config(self) -> None:
+        cfg_loader.save_config(self.AR_CFG, cfg_loader.AR_CFG)
+
+    def chat_setting(self, key: str) -> bool:
+        return self.MAIN_CFG.getboolean("Chat", key)
+
+    # ------------------------------------------------------------------ чёрный список
+
+    @property
+    def blacklist(self) -> list[str]:
+        return self.store.get("blacklist") or []
+
+    def is_blacklisted(self, username: str | None) -> bool:
+        return bool(username) and username.lower() in {u.lower() for u in self.blacklist}
+
+    def blacklist_add(self, username: str) -> None:
+        username = username.strip().lstrip("@")
+        if username and not self.is_blacklisted(username):
+            self.store.update("blacklist", lambda old: sorted((old or []) + [username], key=str.lower))
+
+    def blacklist_remove(self, username: str) -> None:
+        self.store.update("blacklist", lambda old: [u for u in (old or []) if u.lower() != username.lower()])
+
+    def blocked(self, username: str | None, what: str) -> bool:
+        """what: Delivery / Response / Notifications — см. [Blacklist] в _main.cfg."""
+        return self.is_blacklisted(username) and self.MAIN_CFG.getboolean("Blacklist", f"block{what}")
 
     # ------------------------------------------------------------------ события
 
@@ -375,11 +416,119 @@ class IziMarketHub:
                                                  if v[0] in ("paid", "disputed")
                                                  or datetime.fromisoformat(v[1]) >= limit})
 
-    def wake(self, orders: bool = False, refill: bool = False) -> None:
+    # ------------------------------------------------------------------ чаты
+
+    def send_message(self, chat_id: str, text: str | None = None, images: list[str] | None = None,
+                     reply_to_id: str | None = None, by_bot: bool = True) -> ChatMessage:
+        """Отправить сообщение в чат. Бросает IziAPIError/NetworkError — решать вызывающему.
+
+        by_bot=False — сообщение написал человек (например, из Telegram)."""
+        cmid = str(uuid_lib.uuid4())
+        with self._chats_lock:
+            self._sent_by_bot[cmid] = None
+            while len(self._sent_by_bot) > 1000:
+                self._sent_by_bot.popitem(last=False)
+        msg = self.client.send_chat_message(chat_id, text, images=images, reply_to_id=reply_to_id,
+                                            client_message_id=cmid)
+        logger.info(f"Чат {chat_id[:8]}: отправлено сообщение"
+                    f"{' (автоматически)' if by_bot else ''}: {(text or '').strip()[:80]!r}")
+        self.dispatch("MESSAGE_SENT", chat_id, msg, by_bot)
+        return msg
+
+    def is_bot_message(self, message: ChatMessage) -> bool:
+        return bool(message.client_message_id) and message.client_message_id in self._sent_by_bot
+
+    def _chat_state(self, chat_id: str) -> tuple[int, datetime | None] | None:
+        rec = (self.store.get("chat_seqs") or {}).get(chat_id)
+        if rec is None:
+            return None
+        return int(rec[0]), parse_dt(rec[1])
+
+    def known_seq(self, chat_id: str) -> int | None:
+        st = self._chat_state(chat_id)
+        return st[0] if st else None
+
+    def _set_seq(self, chat_id: str, seq: int, at: datetime | None) -> None:
+        def upd(old):
+            old = dict(old or {})
+            old.pop(chat_id, None)
+            # последние обновлённые — в конце, старые вытесняются первыми
+            old[chat_id] = [seq, at.isoformat() if at else None]
+            while len(old) > MAX_KNOWN_CHATS:
+                old.pop(next(iter(old)))
+            return old
+        self.store.update("chat_seqs", upd)
+
+    def init_chats(self) -> None:
+        """Первый запуск: запоминаем, докуда прочитан каждый чат, чтобы не отвечать на старое."""
+        if self.store.get("chats_initialized"):
+            return
+        seqs = {}
+        for chat in reversed(list(self.client.iter_chats(limit=50, max_pages=10))):
+            seqs[chat.id] = [chat.last_seq, chat.last_message_at.isoformat() if chat.last_message_at else None]
+        self.store.set("chat_seqs", seqs)
+        self.store.set("chats_initialized", True)
+        logger.info(f"Чаты: запомнено {len(seqs)} диалогов, новыми будут сообщения с этого момента")
+
+    def process_chat(self, chat: Chat) -> list[ChatMessage]:
+        """Забирает сообщения чата после последнего известного номера и раздаёт события."""
+        with self._chats_lock:
+            state = self._chat_state(chat.id)
+            known = state[0] if state else None
+            if known is not None and chat.last_seq <= known:
+                return []
+            chat.is_new = state is None
+            chat.prev_message_at = state[1] if state else None
+            after = known or 0
+            new: list[ChatMessage] = []
+            last = after
+            for msg in self.client.iter_new_messages(chat.id, after):
+                last = max(last, msg.seq)
+                if msg.seq <= after or self.is_bot_message(msg):
+                    continue
+                new.append(msg)
+            self._set_seq(chat.id, max(last, chat.last_seq), chat.last_message_at)
+        for msg in new:
+            logger.info(f"Чат {chat.id[:8]} [{chat.username}] {msg.author}: {msg.text.strip()[:100]!r}"
+                        + (f" +{len(msg.images)} картинок" if msg.images else ""))
+            self.dispatch("NEW_MESSAGE", chat, msg)
+        if new:
+            self.dispatch("NEW_MESSAGES", chat, new)
+        return new
+
+    def poll_chats(self) -> int:
+        """Чаты идут от свежих к старым: смотрим страницу целиком и листаем дальше,
+        только если на ней все чаты с новыми сообщениями."""
+        n = 0
+        cursor = None
+        for _ in range(5):
+            items, cursor = self.client.list_chats(cursor=cursor, limit=50)
+            changed = 0
+            for chat in items:
+                known = self.known_seq(chat.id)
+                if known is None or chat.last_seq > known:
+                    changed += 1
+                    n += len(self.process_chat(chat))
+            if not cursor or changed < len(items):
+                break
+        return n
+
+    def find_order_chat(self, order_id: str, attempts: int = 6, delay: float = 5) -> Chat | None:
+        """Чат заказа появляется через несколько секунд после покупки — ждём его."""
+        for i in range(attempts):
+            chat = self.client.find_order_chat(order_id)
+            if chat or i == attempts - 1:
+                return chat
+            time.sleep(delay)
+        return None
+
+    def wake(self, orders: bool = False, refill: bool = False, chats: bool = False) -> None:
         if orders:
             self._wake_orders.set()
         if refill:
             self._wake_refill.set()
+        if chats:
+            self._wake_chats.set()
 
     # ------------------------------------------------------------------ потоки
 
@@ -410,6 +559,30 @@ class IziMarketHub:
             self._wake_orders.wait(interval)
             self._wake_orders.clear()
 
+    def _chats_loop(self) -> None:
+        interval = self.MAIN_CFG.getint("Chat", "pollInterval")
+        initialized = False
+        while self.running:
+            wait = interval
+            try:
+                if not initialized:
+                    self.init_chats()
+                    initialized = True
+                self.poll_chats()
+            except InvalidKeyError:
+                return  # об этом сообщит опрос сделок
+            except ScopeMissingError as e:
+                logger.error(f"Чаты недоступны ({e}). Выпустите ключ с правами chats:read и chats:write.")
+                self.chats_available = False
+                return
+            except (IziAPIError, NetworkError) as e:
+                logger.warning(f"Опрос чатов: {e}")
+                wait = max(interval, getattr(e, "retry_after", None) or interval)
+            except Exception:
+                logger.error(f"Опрос чатов упал:\n{traceback.format_exc()}")
+            self._wake_chats.wait(wait)
+            self._wake_chats.clear()
+
     def _refill_loop(self) -> None:
         from handlers import refill_stock_all  # здесь, чтобы не было циклического импорта
         interval = self.MAIN_CFG.getint("StockRefill", "checkInterval")
@@ -433,9 +606,14 @@ class IziMarketHub:
             raise SystemExit("Ключ API не действует: выпустите новый в кабинете IziMarket → Настройки → API")
         key = self.me.get("key", {})
         logger.info(f"Аккаунт: {self.me.get('username')}  ключ {key.get('prefix')}… до {key.get('expires_at')}")
-        missing = [s for s in REQUIRED_SCOPES if s not in key.get("scopes", [])]
+        scopes = key.get("scopes", [])
+        missing = [s for s in REQUIRED_SCOPES if s not in scopes]
         if missing:
             logger.warning(f"У ключа нет прав: {', '.join(missing)} — часть функций работать не будет")
+        if self.chat_setting("enabled") and scopes and not all(s in scopes for s in CHAT_SCOPES):
+            self.chats_available = False
+            logger.warning("У ключа нет прав chats:read / chats:write — чаты, автоответчик и приветствия "
+                           "выключены. Выпустите новый ключ, отметив эти права.")
         exp = key.get("expires_at")
         if exp and datetime.fromisoformat(exp) - _now() < timedelta(days=7):
             logger.warning(f"Ключ API истекает {exp} — выпустите новый заранее")
@@ -451,6 +629,8 @@ class IziMarketHub:
                 logger.warning(f"Не удалось получить ожидающие сделки: {e}")
         threads = [threading.Thread(target=self._orders_loop, name="orders", daemon=True),
                    threading.Thread(target=self._refill_loop, name="refill", daemon=True)]
+        if self.chat_setting("enabled") and self.chats_available:
+            threads.append(threading.Thread(target=self._chats_loop, name="chats", daemon=True))
         for t in threads:
             t.start()
         logger.info(f"IziMarketHub v{VERSION} запущен. Автор: {AUTHOR} ({AUTHOR_LINK})")
@@ -470,6 +650,7 @@ class IziMarketHub:
         self.running = False
         self._wake_orders.set()
         self._wake_refill.set()
+        self._wake_chats.set()
 
 
 def _now() -> datetime:

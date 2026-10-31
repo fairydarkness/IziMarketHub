@@ -17,6 +17,7 @@ EVENT_TYPES = [
     "product.price_changed", "product.stock.depleted", "product.stock.low", "product.stock.replenished",
     "order.created", "order.delivered", "order.redelivered", "order.disputed", "order.completed",
     "order.refunded", "order.payout_released", "order.delivery_requested",
+    "message.created",
 ]
 
 MAX_AGE = 300

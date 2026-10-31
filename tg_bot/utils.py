@@ -7,7 +7,7 @@ import hmac
 import os
 from html import escape
 
-from IziAPI import Order, Product
+from IziAPI import Chat, ChatMessage, Order, Product
 
 
 def hash_password(password: str) -> str:
@@ -62,3 +62,37 @@ def product_line(p: Product) -> str:
 
 def truncate(text: str, limit: int = 3900) -> str:
     return text if len(text) <= limit else text[:limit] + "\n…"
+
+
+def author_label(chat: Chat, msg: ChatMessage) -> str:
+    if msg.by_me:
+        return "🧑‍💼 Вы" + (" (авто)" if msg.automatic else "")
+    if msg.by_counterpart:
+        return f"👤 {b(chat.username)}"
+    if msg.by_staff:
+        return f"🛡 {b(msg.raw.get('staff_role') or 'Поддержка')}"
+    return "ℹ️ Система"
+
+
+def message_body(msg: ChatMessage, limit: int = 1500) -> str:
+    if msg.deleted:
+        return "<i>сообщение удалено</i>"
+    if msg.withheld:
+        return "<i>сообщение скрыто (только арбитру)</i>"
+    parts = []
+    text = msg.text.replace("\ufffc", "").strip()
+    if text:
+        parts.append(escape(text[:limit]) + ("…" if len(text) > limit else ""))
+    if msg.type not in ("text", "image") and not text:
+        parts.append(f"<i>{escape(msg.type)}</i>")
+    for i, img in enumerate(msg.images, 1):
+        url = img.get("url") if isinstance(img, dict) else img if isinstance(img, str) else None
+        parts.append(f'🖼 <a href="{escape(url)}">картинка {i}</a>' if url else "🖼 картинка")
+    if msg.raw.get("attachments"):
+        parts.append(f"📎 вложений: {len(msg.raw['attachments'])}")
+    return "\n".join(parts) or "<i>пусто</i>"
+
+
+def chat_title(chat: Chat) -> str:
+    where = f" · заказ «{escape((chat.order_title or '')[:40])}»" if chat.type == "order" else ""
+    return f"💬 {b(chat.username)}{where}"

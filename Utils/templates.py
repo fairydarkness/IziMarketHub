@@ -11,6 +11,9 @@ $date / $time   — текущие дата и время
 $product        — выдаваемые единицы товара из файла (каждая с новой строки)
 $input_<key>    — что покупатель ввёл при покупке (например, $input_nick)
 $param_<N>      — выбранный параметр по номеру группы (например, $param_12)
+
+В сообщениях чата (автоответчик, приветствие):
+$username, $chat_id, $order_id, $order_title, $message_text, $date, $time
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
-from IziAPI.types import Order
+from IziAPI.types import Chat, ChatMessage, Order
 
 _INPUT_RE = re.compile(r"\$input_([A-Za-z0-9_\-]+)")
 _PARAM_RE = re.compile(r"\$param_(\d+)")
@@ -56,3 +59,20 @@ def format_text(text: str, order: Order, goods: list[str] | None = None) -> str:
     for key in sorted(values, key=len, reverse=True):
         text = text.replace(key, values[key])
     return text
+
+
+def format_chat_text(text: str, chat: Chat, message: ChatMessage | None = None) -> str:
+    now = datetime.now()
+    values = {
+        "$username": chat.counterpart.username or "покупатель",
+        "$chat_id": chat.id,
+        "$order_id": chat.order_id or "",
+        "$order_title": chat.order_title or "",
+        "$message_text": message.text if message else "",
+        "$date": now.strftime("%d.%m.%Y"),
+        "$time": now.strftime("%H:%M"),
+    }
+    text = text.replace("\\n", "\n")
+    # один проход: подставленный текст сообщения не раскрывается повторно
+    pattern = "|".join(re.escape(k) for k in sorted(values, key=len, reverse=True))
+    return re.sub(pattern, lambda m: values[m.group(0)], text)

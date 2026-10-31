@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -20,7 +21,7 @@ from typing import Any, Iterator
 import requests
 
 from .exceptions import IziAPIError, NetworkError, RateLimitError, make_error
-from .types import Balance, Order, Product, StockPage
+from .types import Balance, Chat, ChatMessage, Order, Product, StockPage
 
 logger = logging.getLogger("IziAPI")
 
@@ -259,6 +260,78 @@ class Client:
         if fields:
             body["fields"] = fields
         return Order.from_dict(self.request("POST", f"/orders/{order_id}/deliver", json=body))
+
+    # ------------------------------------------------------------------ чаты
+
+    def list_chats(self, type: str | None = None, unread_only: bool = False, order_id: str | None = None,
+                   cursor: str | None = None, limit: int = 20) -> tuple[list[Chat], str | None]:
+        """Чаты от свежих к старым по last_message_at. type: direct / order / all."""
+        d = self.get("/chats", type=type, unread_only="1" if unread_only else None, order_id=order_id,
+                     cursor=cursor, limit=limit)
+        nxt = d.get("next_cursor") if d.get("has_next_page") else None
+        return [Chat.from_dict(c) for c in d["items"]], nxt
+
+    def iter_chats(self, max_pages: int = 20, **filters) -> Iterator[Chat]:
+        cursor = None
+        for _ in range(max_pages):
+            items, cursor = self.list_chats(cursor=cursor, **filters)
+            yield from items
+            if not cursor:
+                return
+
+    def get_chat(self, chat_id: str) -> Chat:
+        """Карточка чата: можно ли писать (can_write) и почему нет (write_blocked_reason)."""
+        return Chat.from_dict(self.get(f"/chats/{chat_id}"))
+
+    def find_order_chat(self, order_id: str) -> Chat | None:
+        """Чат заказа. Сразу после order.created его может ещё не быть."""
+        items, _ = self.list_chats(type="order", order_id=order_id)
+        return items[0] if items else None
+
+    def list_chat_messages(self, chat_id: str, after_seq: int | None = None, cursor: str | None = None,
+                           limit: int = 50) -> tuple[list[ChatMessage], str | None]:
+        """Без after_seq — последние сообщения (курсор ведёт к более ранним), с ним — новые после номера.
+        Сообщения всегда по возрастанию seq."""
+        d = self.get(f"/chats/{chat_id}/messages", after_seq=after_seq, cursor=cursor, limit=limit)
+        nxt = d.get("next_cursor") if d.get("has_next_page") else None
+        return [ChatMessage.from_dict(m) for m in d["items"]], nxt
+
+    def iter_new_messages(self, chat_id: str, after_seq: int, max_pages: int = 20) -> Iterator[ChatMessage]:
+        cursor = None
+        for _ in range(max_pages):
+            items, cursor = self.list_chat_messages(chat_id, after_seq=after_seq, cursor=cursor, limit=100)
+            yield from items
+            if not cursor:
+                return
+
+    def send_chat_message(self, chat_id: str, text: str | None = None, images: list[str] | None = None,
+                          reply_to_id: str | None = None, client_message_id: str | None = None) -> ChatMessage:
+        """Ответ в существующий чат. Повтор безопасен: client_message_id и Idempotency-Key."""
+        body: dict[str, Any] = {"client_message_id": client_message_id or str(uuid.uuid4())}
+        if text:
+            body["text"] = text[:4000]
+        if images:
+            body["images"] = images
+        if reply_to_id:
+            body["reply_to_id"] = reply_to_id
+        return ChatMessage.from_dict(self.request("POST", f"/chats/{chat_id}/messages", json=body,
+                                                  idempotency_key=self.new_idempotency_key()))
+
+    def mark_chat_read(self, chat_id: str, seq: int | None = None) -> dict:
+        return self.request("POST", f"/chats/{chat_id}/read", json={"seq": seq} if seq is not None else {})
+
+    def upload_chat_image(self, file, filename: str = "image.jpg", idempotency_key: str | None = None) -> dict:
+        """Картинка для ответа в чат заказа. ``file`` — путь, байты или открытый файл; id уходит в images."""
+        if isinstance(file, str):
+            with open(file, "rb") as f:
+                content = f.read()
+            filename = os.path.basename(file)
+        elif isinstance(file, (bytes, bytearray)):
+            content = bytes(file)
+        else:
+            content = file.read()
+        return self.request("POST", "/chats/media", files={"file": (filename, content)},
+                            idempotency_key=idempotency_key or self.new_idempotency_key())
 
     # ------------------------------------------------------------------ аналитика
 

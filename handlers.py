@@ -1,16 +1,19 @@
-"""Встроенные обработчики: автовыдача, автодеактивация, синхронизация количества, пополнение склада."""
+"""Встроенные обработчики: автовыдача, автодеактивация, синхронизация количества, пополнение склада,
+автоответчик, приветствие и ответы в чат заказа."""
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-from IziAPI import Order, Product
+from IziAPI import Chat, ChatMessage, Order, Product
 from IziAPI.exceptions import ConflictError, IziAPIError, NetworkError
 from Utils.config_loader import is_true
 from Utils.storage import unescape_item
-from Utils.templates import format_text
+from Utils.templates import format_chat_text, format_text
 
 if TYPE_CHECKING:
     from hub import IziMarketHub
@@ -24,6 +27,10 @@ REFILL_FAILED_DIR = os.path.join("storage", "refill_failed")
 
 def auto_delivery_handler(hub: IziMarketHub, order: Order) -> None:
     if order.status != "paid" or not hub.setting("autoDelivery"):
+        return
+    if hub.blocked(order.buyer.username, "Delivery"):
+        logger.info(f"Сделка #{order.id[:8]}: {order.buyer.username} в чёрном списке — автовыдача пропущена")
+        hub.dispatch("DELIVERY_FAILED", order, "покупатель в чёрном списке")
         return
     section = hub.find_ad_section(order.product_id, order.product_title)
     if not section:
@@ -203,12 +210,134 @@ def _save_failed(file_name: str, items: list[str], reason: str) -> None:
         f.writelines(i + "\n" for i in items)
 
 
+# ---------------------------------------------------------------------- чаты
+
+def find_command(hub: IziMarketHub, text: str) -> str | None:
+    """Секция автоответчика для текста: точное совпадение команды (без регистра) или вхождение,
+    если у команды contains = 1. Несколько команд в одной секции — через |."""
+    text = " ".join(text.lower().split())
+    if not text:
+        return None
+    for section in hub.AR_CFG.sections():
+        s = hub.AR_CFG[section]
+        if is_true(s.get("disable")):
+            continue
+        for cmd in section.split("|"):
+            cmd = " ".join(cmd.lower().split())
+            if cmd and (text == cmd or (is_true(s.get("contains")) and cmd in text)):
+                return section
+    return None
+
+
+def _send_safe(hub: IziMarketHub, chat_id: str, text: str, what: str) -> bool:
+    try:
+        hub.send_message(chat_id, text)
+        return True
+    except (IziAPIError, NetworkError) as e:
+        logger.warning(f"Чат {chat_id[:8]}: {what} не отправлено: {e}")
+        return False
+
+
+def auto_response_handler(hub: IziMarketHub, chat: Chat, msg: ChatMessage) -> None:
+    if not msg.by_counterpart or not msg.text or not hub.chat_setting("autoResponse"):
+        return
+    section = find_command(hub, msg.text)
+    if not section:
+        return
+    if hub.blocked(chat.counterpart.username, "Response"):
+        logger.info(f"Чат {chat.id[:8]}: {chat.username} в чёрном списке — автоответ пропущен")
+        return
+    s = hub.AR_CFG[section]
+    logger.info(f"Чат {chat.id[:8]}: команда «{section}» от {chat.username}")
+    if s.get("response"):
+        sent = _send_safe(hub, chat.id, format_chat_text(s["response"], chat, msg), f"ответ на «{section}»")
+        if sent and hub.chat_setting("markReadAfterResponse"):
+            try:
+                hub.client.mark_chat_read(chat.id)
+            except (IziAPIError, NetworkError):
+                pass
+    if is_true(s.get("telegramNotification")) and hub.tg:
+        hub.tg.on_command(chat, msg, section, s.get("notificationText") or "")
+
+
+def greetings_handler(hub: IziMarketHub, chat: Chat, messages: list[ChatMessage]) -> None:
+    """Приветствие: новому собеседнику или тому, кто не писал дольше greetingsCooldown дней."""
+    if not hub.chat_setting("greetings") or not hub.chats_available:
+        return
+    if chat.type == "order" and not hub.chat_setting("greetingsOrderChats"):
+        return
+    first = next((m for m in messages if m.by_counterpart), None)
+    if not first or any(m.by_me for m in messages if m.seq < first.seq):
+        return
+    if find_command(hub, first.text):
+        return  # на команду отвечает автоответчик
+    if hub.blocked(chat.counterpart.username, "Response"):
+        return
+    cooldown = timedelta(days=hub.MAIN_CFG.getint("Chat", "greetingsCooldown"))
+    now = datetime.now(timezone.utc)
+    greeted = (hub.store.get("greeted") or {}).get(chat.id)
+    if greeted and now - datetime.fromisoformat(greeted) < cooldown:
+        return
+    if not chat.is_new:
+        prev = chat.prev_message_at
+        if prev is None or (first.created_at or now) - prev < cooldown:
+            return
+    text = hub.MAIN_CFG.get("Chat", "greetingsText")
+    if text and _send_safe(hub, chat.id, format_chat_text(text, chat, first), "приветствие"):
+        hub.store.update("greeted", lambda old: _prune_dates({**(old or {}), chat.id: now.isoformat()}))
+
+
+def _prune_dates(d: dict, days: int = 60) -> dict:
+    limit = datetime.now(timezone.utc) - timedelta(days=days)
+    return {k: v for k, v in d.items() if datetime.fromisoformat(v) >= limit}
+
+
+def _order_reply(hub: IziMarketHub, order: Order, key: str) -> None:
+    """Ответ в чат заказа (новый заказ / подтверждение). Чат появляется не сразу — ждём в фоне."""
+    if not hub.chat_setting("enabled") or not hub.chat_setting(key) or not hub.chats_available:
+        return
+    if hub.blocked(order.buyer.username, "Response"):
+        return
+    done_key = f"{key}:{order.id}"
+    if done_key in (hub.store.get("order_replies") or {}):
+        return
+    text = format_text(hub.MAIN_CFG.get("Chat", f"{key}Text"), order)
+    if not text.strip():
+        return
+
+    def run():
+        try:
+            chat = hub.find_order_chat(order.id)
+        except (IziAPIError, NetworkError) as e:
+            logger.warning(f"Сделка #{order.id[:8]}: чат не найден: {e}")
+            return
+        if not chat:
+            logger.warning(f"Сделка #{order.id[:8]}: чат заказа так и не появился — сообщение не отправлено")
+            return
+        if _send_safe(hub, chat.id, text, "сообщение по заказу"):
+            hub.store.update("order_replies", lambda old: _prune_dates(
+                {**(old or {}), done_key: datetime.now(timezone.utc).isoformat()}))
+
+    threading.Thread(target=run, name=f"order-reply-{order.id[:8]}", daemon=True).start()
+
+
+def new_order_reply_handler(hub: IziMarketHub, order: Order) -> None:
+    _order_reply(hub, order, "newOrderReply")
+
+
+def order_confirm_reply_handler(hub: IziMarketHub, order: Order, old_status: str) -> None:
+    if order.status == "completed":
+        _order_reply(hub, order, "orderConfirmReply")
+
+
 # ---------------------------------------------------------------------- вебхуки
 
 def webhook_router(hub: IziMarketHub, event) -> None:
     """Вебхук — только сигнал: данные всё равно берутся опросом, так ничего не теряется."""
     if event.type.startswith("order."):
         hub.wake(orders=True)
+    elif event.type.startswith("message."):
+        hub.wake(chats=True)
     elif event.type in ("product.stock.low", "product.stock.depleted"):
         pid = (event.data.get("product") or {}).get("id")
         if pid:
@@ -222,4 +351,8 @@ def webhook_router(hub: IziMarketHub, event) -> None:
 
 def register_handlers(hub: IziMarketHub) -> None:
     hub.add_handler("NEW_ORDER", auto_delivery_handler)
+    hub.add_handler("NEW_ORDER", new_order_reply_handler)
+    hub.add_handler("ORDER_STATUS_CHANGED", order_confirm_reply_handler)
+    hub.add_handler("NEW_MESSAGE", auto_response_handler)
+    hub.add_handler("NEW_MESSAGES", greetings_handler)
     hub.add_handler("WEBHOOK_EVENT", webhook_router)

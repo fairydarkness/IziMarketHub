@@ -7,6 +7,7 @@ import os
 import threading
 import time
 import traceback
+from collections import OrderedDict
 from datetime import date, timedelta
 from html import escape
 from typing import TYPE_CHECKING, Callable
@@ -15,9 +16,10 @@ import telebot
 from telebot import apihelper
 from telebot.types import (BotCommand, CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup, Message)
 
-from IziAPI import Money, Order, Product
+from IziAPI import Chat, ChatMessage, Money, Order, Product
 from IziAPI.exceptions import IziAPIError, NetworkError
-from Utils.config_loader import AD_SCHEMA, is_true
+from Utils.config_loader import AD_SCHEMA, AR_SCHEMA, is_true
+from Utils.templates import format_chat_text
 from Utils import updater
 from Utils.logger import LOG_FILE
 from . import utils as u
@@ -28,6 +30,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger("IMH.tg")
 
 NOTIFY_KINDS = {
+    "message": "💬 Сообщения в чатах",
+    "command": "🤖 Команды автоответчика",
     "new_order": "🛒 Новые сделки",
     "delivery": "📬 Выдача",
     "status": "🔄 Смена статуса",
@@ -51,13 +55,38 @@ DEFAULT_RESPONSE = "Спасибо за покупку, $username!\\nВаш то
 
 # страницы главного меню: (подпись, callback)
 MENU_PAGES = [
-    [("🧾 Сделки", "orders"), ("🛍 Мои товары", "pr:1"),
-     ("📦 Автовыдача", "ad:0"), ("📁 Файлы товаров", "gf"),
-     ("💰 Баланс", "balance"), ("📊 Статистика", "stats")],
-    [("⚙️ Переключатели", "sw"), ("🔔 Уведомления", "nt"),
-     ("🧩 Плагины", "pl"), ("🔄 Обновление", "upd"),
-     ("ℹ️ О боте", "about")],
+    [("💬 Чаты", "chl:0"), ("🧾 Сделки", "orders"),
+     ("🛍 Мои товары", "pr:1"), ("📦 Автовыдача", "ad:0"),
+     ("📁 Файлы товаров", "gf"), ("💰 Баланс", "balance")],
+    [("🤖 Автоответчик", "ar:0"), ("📝 Заготовки ответов", "tpl"),
+     ("👋 Сообщения бота", "chs"), ("🚫 Чёрный список", "bl"),
+     ("📊 Статистика", "stats"), ("⚙️ Переключатели", "sw")],
+    [("🔔 Уведомления", "nt"), ("🧩 Плагины", "pl"),
+     ("🔄 Обновление", "upd"), ("ℹ️ О боте", "about")],
 ]
+
+# переключатели и тексты сообщений, которые бот сам пишет в чаты: [Chat] в _main.cfg
+CHAT_SWITCHES = {
+    "autoResponse": "Автоответчик",
+    "greetings": "Приветствие новых собеседников",
+    "greetingsOrderChats": "…и в чатах заказов",
+    "newOrderReply": "Сообщение при новом заказе",
+    "orderConfirmReply": "Сообщение при подтверждении",
+    "markReadAfterResponse": "Читать чат после автоответа",
+    "notifyOwnMessages": "Уведомлять о своих сообщениях",
+}
+CHAT_TEXTS = {
+    "greetingsText": "👋 Приветствие",
+    "newOrderReplyText": "🛒 Новый заказ",
+    "orderConfirmReplyText": "✅ Подтверждение",
+}
+BLACKLIST_SWITCHES = {
+    "blockDelivery": "Не выдавать автоматически",
+    "blockResponse": "Не отвечать автоматически",
+    "blockNotifications": "Не присылать уведомления",
+}
+CHAT_VARS = "$username, $order_title, $order_id, $message_text, $date, $time"
+ORDER_VARS = "$username, $product_title, $order_id, $quantity, $amount, $date, $time"
 # «Назад» из раздела возвращает на ту страницу меню, где он лежит
 MENU_PAGE_OF = {cb.split(":")[0]: i for i, page in enumerate(MENU_PAGES) for _, cb in page}
 
@@ -104,6 +133,8 @@ class TGBot:
         self.bot = telebot.TeleBot(tg["token"], parse_mode="HTML", threaded=True)
         self._pending: dict[int, tuple[str, str]] = {}  # chat_id → (действие, аргумент)
         self._attempts: dict[int, tuple[int, float]] = {}
+        # (чат Telegram, id сообщения) → (чат IziMarket, это уведомление): ответ на него уходит собеседнику
+        self._reply_map: OrderedDict[tuple[int, int], tuple[str, bool]] = OrderedDict()
         self._register()
 
     # ------------------------------------------------------------------ доступ
@@ -140,16 +171,28 @@ class TGBot:
 
     # ------------------------------------------------------------------ уведомления
 
-    def send(self, chat_id: int | str, text: str, markup=None) -> None:
+    def send(self, chat_id: int | str, text: str, markup=None) -> Message | None:
         try:
-            self.bot.send_message(chat_id, u.truncate(text), reply_markup=markup, disable_web_page_preview=True)
+            return self.bot.send_message(chat_id, u.truncate(text), reply_markup=markup,
+                                         disable_web_page_preview=True)
         except Exception as e:
             logger.warning(f"Не удалось отправить сообщение в {chat_id}: {e}")
+            return None
 
-    def notify(self, kind: str, text: str, markup=None) -> None:
+    def notify(self, kind: str, text: str, markup=None, izi_chat: str | None = None) -> None:
         for chat_id, prefs in self.chats.items():
             if prefs.get(kind, True):
-                self.send(chat_id, text, markup)
+                msg = self.send(chat_id, text, markup)
+                if msg and izi_chat:
+                    self._remember_reply(msg, izi_chat, notification=True)
+
+    def _remember_reply(self, msg: Message | CallbackQuery, izi_chat: str, notification: bool = False) -> None:
+        if isinstance(msg, CallbackQuery):
+            msg = msg.message
+        key = (msg.chat.id, msg.message_id)
+        self._reply_map[key] = (izi_chat, notification)
+        while len(self._reply_map) > 3000:
+            self._reply_map.popitem(last=False)
 
     def notify_system(self, text: str) -> None:
         self.notify("system", text)
@@ -194,6 +237,36 @@ class TGBot:
     def on_stock_refilled(self, hub, product: Product, added: int) -> None:
         self.notify("stock", f"📦 Склад «{escape(product.title)}» пополнен на {added}")
 
+    def _chat_markup(self, chat: Chat) -> InlineKeyboardMarkup:
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(Btn("✉️ Ответить", callback_data=f"chr:{chat.id}"),
+               Btn("📝 Заготовки", callback_data=f"ctp:{chat.id}"))
+        kb.add(Btn("📜 История", callback_data=f"chv:{chat.id}"),
+               Btn("✅ Прочитано", callback_data=f"crd:{chat.id}"))
+        kb.add(Btn("🔗 На сайте", url=chat.url))
+        return kb
+
+    def on_new_messages(self, hub, chat: Chat, messages: list[ChatMessage]) -> None:
+        if hub.blocked(chat.counterpart.username, "Notifications"):
+            return
+        own = hub.chat_setting("notifyOwnMessages")
+        shown = [m for m in messages if not m.by_me or own]
+        if not shown:
+            return
+        lines = [u.chat_title(chat)]
+        for m in shown[-10:]:
+            body = u.message_body(m)
+            lines.append(body if m.by_counterpart and len(shown) == 1 else f"{u.author_label(chat, m)}: {body}")
+        if len(shown) > 10:
+            lines.insert(1, f"<i>…и ещё {len(shown) - 10} раньше</i>")
+        lines.append("\n<i>Ответьте на это сообщение, чтобы написать собеседнику</i>")
+        self.notify("message", "\n".join(lines), self._chat_markup(chat), izi_chat=chat.id)
+
+    def on_command(self, chat: Chat, msg: ChatMessage, command: str, text: str) -> None:
+        body = escape(format_chat_text(text, chat, msg)) if text else \
+            f"{u.b(chat.username)} отправил команду {u.code(command)}"
+        self.notify("command", f"🤖 {body}", self._chat_markup(chat), izi_chat=chat.id)
+
     def on_webhook(self, hub, event) -> None:
         if event.type == "product.moderation.rejected":
             p = event.data.get("product") or {}
@@ -213,6 +286,7 @@ class TGBot:
         h("PRODUCT_RESTORED", self.on_product_restored)
         h("STOCK_REFILLED", self.on_stock_refilled)
         h("WEBHOOK_EVENT", self.on_webhook)
+        h("NEW_MESSAGES", self.on_new_messages)
 
     # ------------------------------------------------------------------ меню
 
@@ -243,6 +317,20 @@ class TGBot:
             if "message is not modified" not in str(e):
                 raise
         self.bot.answer_callback_query(call.id)
+
+    def _show(self, c: CallbackQuery, text: str, kb: InlineKeyboardMarkup | None = None,
+              izi_chat: str | None = None) -> None:
+        """Уведомление о сообщении не затираем — открываем раздел новым сообщением."""
+        rec = self._reply_map.get((c.message.chat.id, c.message.message_id))
+        if not rec or not rec[1]:
+            self._edit(c, text, kb)
+            msg = c.message
+        else:
+            self.bot.answer_callback_query(c.id)
+            msg = self.send(c.message.chat.id, text, kb)
+        if msg and izi_chat:
+            # ответ на окно чата тоже уходит собеседнику
+            self._remember_reply(msg, izi_chat)
 
     def switches_view(self) -> tuple[str, InlineKeyboardMarkup]:
         kb = InlineKeyboardMarkup()
@@ -344,6 +432,135 @@ class TGBot:
                *([] if p.stock_managed else [Btn("🔢 Количество", callback_data=f"pqty:{p.id}")]))
         kb.add(Btn("🔗 На сайте", url=p.url))
         return text, self._back(kb, "pr:1")
+
+    # ---- чаты
+
+    def chats_view(self, unread: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+        if not self.hub.chats_available:
+            return ("💬 Чаты недоступны: у ключа API нет прав chats:read / chats:write.\n"
+                    "Выпустите новый ключ, отметив эти права, и пропишите его в configs/_main.cfg."), self._back()
+        items, _ = self.hub.client.list_chats(unread_only=unread, limit=20)
+        kb = InlineKeyboardMarkup()
+        for ch in items:
+            mark = f"🔵{ch.unread_count} " if ch.unread_count else ""
+            kind = "🛒 " if ch.type == "order" else ""
+            last = ch.last_message.text.replace("\ufffc", "🖼").strip()[:25] if ch.last_message else ""
+            kb.add(Btn(f"{mark}{kind}{ch.username[:20]}: {last}", callback_data=f"chv:{ch.id}"))
+        kb.add(Btn("📋 Все" if unread else "🔵 Только непрочитанные", callback_data=f"chl:{0 if unread else 1}"),
+               Btn("🔄", callback_data=f"chl:{1 if unread else 0}"))
+        title = "💬 <b>Непрочитанные чаты</b>" if unread else "💬 <b>Последние чаты</b>"
+        return (title if items else title + "\n\nПусто"), self._back(kb, section="chl")
+
+    def chat_view(self, chat_id: str, n: int = 15) -> tuple[str, InlineKeyboardMarkup]:
+        chat = self.hub.client.get_chat(chat_id)
+        msgs, _ = self.hub.client.list_chat_messages(chat_id, limit=n)
+        lines = [u.chat_title(chat)]
+        for m in msgs:
+            when = m.created_at.astimezone().strftime("%d.%m %H:%M") if m.created_at else ""
+            lines.append(f"\n<i>{when}</i> {u.author_label(chat, m)}\n{u.message_body(m, 500)}")
+        if chat.can_write is False:
+            lines.append(f"\n🔒 Писать нельзя: {u.code(chat.write_blocked_reason or '?')}")
+        text = "\n".join(lines)
+        if len(text) > 3900:  # Telegram режет длинное — оставляем свежие сообщения
+            text = lines[0] + "\n…" + text[-(3800 - len(lines[0])):]
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(Btn("✉️ Ответить", callback_data=f"chr:{chat.id}"),
+               Btn("📝 Заготовки", callback_data=f"ctp:{chat.id}"))
+        kb.add(Btn("✅ Прочитано", callback_data=f"crd:{chat.id}"),
+               Btn("🔄 Обновить", callback_data=f"chv:{chat.id}"))
+        if chat.counterpart.username:
+            bl = self.hub.is_blacklisted(chat.counterpart.username)
+            kb.add(Btn("✅ Убрать из ЧС" if bl else "🚫 В чёрный список", callback_data=f"cbl:{chat.id}"))
+        if chat.order_id:
+            kb.add(Btn("🧾 Сделка", callback_data=f"ord:{chat.order_id}"), Btn("🔗 На сайте", url=chat.url))
+        else:
+            kb.add(Btn("🔗 На сайте", url=chat.url))
+        return text, self._back(kb, "chl:0")
+
+    @property
+    def templates(self) -> list[str]:
+        return self.hub.store.get("answer_templates") or []
+
+    def templates_view(self) -> tuple[str, InlineKeyboardMarkup]:
+        kb = InlineKeyboardMarkup()
+        for i, t in enumerate(self.templates):
+            kb.add(Btn(f"🗑 {t.replace(chr(10), ' ')[:50]}", callback_data=f"tpd:{i}"))
+        kb.add(Btn("➕ Добавить заготовку", callback_data="tpa"))
+        text = ("📝 <b>Заготовки ответов</b>\nОтправляются кнопкой «📝 Заготовки» под уведомлением о сообщении. "
+                f"Переменные: {CHAT_VARS}.\nНажмите на заготовку, чтобы удалить её.")
+        return text, self._back(kb, section="tpl")
+
+    def chat_templates_view(self, chat_id: str) -> tuple[str, InlineKeyboardMarkup]:
+        kb = InlineKeyboardMarkup()
+        for i, t in enumerate(self.templates):
+            kb.add(Btn(t.replace("\n", " ")[:60], callback_data=f"cts:{i}:{chat_id}"))
+        if not self.templates:
+            kb.add(Btn("➕ Добавить заготовку", callback_data="tpa"))
+        return "📝 Выберите заготовку — она сразу уйдёт собеседнику", self._back(kb, f"chv:{chat_id}")
+
+    def ar_view(self, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+        sections = self.hub.AR_CFG.sections()
+        per = 10
+        kb = InlineKeyboardMarkup()
+        for i, sec in enumerate(sections[page * per:(page + 1) * per], start=page * per):
+            kb.add(Btn(f"{_onoff(not is_true(self.hub.AR_CFG.get(sec, 'disable')))} {sec[:50]}",
+                       callback_data=f"are:{i}"))
+        nav = []
+        if page > 0:
+            nav.append(Btn("⬅️", callback_data=f"ar:{page - 1}"))
+        if (page + 1) * per < len(sections):
+            nav.append(Btn("➡️", callback_data=f"ar:{page + 1}"))
+        if nav:
+            kb.row(*nav)
+        kb.add(Btn("➕ Добавить команду", callback_data="ara"))
+        text = (f"🤖 <b>Автоответчик</b> — {len(sections)} команд\n"
+                f"Включён: {_onoff(self.hub.chat_setting('autoResponse'))}\n"
+                "Когда собеседник пишет команду, бот отвечает заданным текстом. "
+                "Файл: configs/auto_response.cfg")
+        return text, self._back(kb, section="ar")
+
+    def ar_edit_view(self, idx: int) -> tuple[str, InlineKeyboardMarkup]:
+        sec = self.hub.AR_CFG.sections()[idx]
+        s = self.hub.AR_CFG[sec]
+        text = (f"🤖 Команда {u.code(sec)}\n\nОтвет:\n<code>{escape(s.get('response') or '—')}</code>"
+                + (f"\n\nТекст уведомления:\n<code>{escape(s.get('notificationText'))}</code>"
+                   if s.get("notificationText") else ""))
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(Btn(f"{_onoff(not is_true(s.get('disable')))} Включена", callback_data=f"art:{idx}:disable"))
+        kb.add(Btn(f"{_onoff(is_true(s.get('contains')))} Срабатывать, если команда внутри текста",
+                   callback_data=f"art:{idx}:contains"))
+        kb.add(Btn(f"{_onoff(is_true(s.get('telegramNotification')))} Уведомлять в Telegram",
+                   callback_data=f"art:{idx}:telegramNotification"))
+        kb.add(Btn("✏️ Изменить ответ", callback_data=f"arr:{idx}"),
+               Btn("✏️ Текст уведомления", callback_data=f"arn:{idx}"))
+        kb.add(Btn("🗑 Удалить", callback_data=f"ard:{idx}"))
+        return text, self._back(kb, "ar:0")
+
+    def chat_settings_view(self) -> tuple[str, InlineKeyboardMarkup]:
+        c = self.hub.MAIN_CFG["Chat"]
+        kb = InlineKeyboardMarkup(row_width=1)
+        for key, title in CHAT_SWITCHES.items():
+            kb.add(Btn(f"{_onoff(self.hub.chat_setting(key))} {title}", callback_data=f"cst:{key}"))
+        kb.row(*(Btn(f"✏️ {title}", callback_data=f"csx:{key}") for key, title in CHAT_TEXTS.items()))
+        text = ("👋 <b>Сообщения, которые бот пишет сам</b>\n\n"
+                f"Приветствие (раз в {c.get('greetingsCooldown')} дн.):\n<code>{escape(c.get('greetingsText'))}</code>\n\n"
+                f"Новый заказ:\n<code>{escape(c.get('newOrderReplyText'))}</code>\n\n"
+                f"Подтверждение заказа:\n<code>{escape(c.get('orderConfirmReplyText'))}</code>")
+        if not self.hub.chats_available:
+            text += "\n\n⚠️ У ключа API нет прав на чаты — сообщения не отправляются."
+        return text, self._back(kb, section="chs")
+
+    def blacklist_view(self) -> tuple[str, InlineKeyboardMarkup]:
+        kb = InlineKeyboardMarkup()
+        for key, title in BLACKLIST_SWITCHES.items():
+            kb.add(Btn(f"{_onoff(self.hub.MAIN_CFG.getboolean('Blacklist', key))} {title}",
+                       callback_data=f"blt:{key}"))
+        for name in self.hub.blacklist[:40]:
+            kb.add(Btn(f"❌ {name}", callback_data=f"bld:{name}"[:64]))
+        kb.add(Btn("➕ Добавить пользователя", callback_data="bla"))
+        text = (f"🚫 <b>Чёрный список</b> — {len(self.hub.blacklist)} чел.\n"
+                "Нажмите на ник, чтобы убрать его из списка.")
+        return text, self._back(kb, section="bl")
 
     def plugins_view(self) -> tuple[str, InlineKeyboardMarkup]:
         kb = InlineKeyboardMarkup()
@@ -458,6 +675,7 @@ class TGBot:
         bot.message_handler(commands=["orders"])(self._guard(lambda m: self.send(m.chat.id, self.orders_text())))
         bot.message_handler(commands=["stats"])(self._guard(lambda m: self.send(m.chat.id, self.stats_text())))
         bot.message_handler(commands=["about"])(self._guard(lambda m: self.send(m.chat.id, self.about_text())))
+        bot.message_handler(commands=["chats"])(self._guard(lambda m: self.send(m.chat.id, *self.chats_view())))
 
         @bot.message_handler(commands=["update"])
         @self._guard
@@ -503,12 +721,27 @@ class TGBot:
             else:
                 self._save_plugin(m.chat.id, m.document.file_name, data)
 
+        @bot.message_handler(content_types=["photo"])
+        @self._guard
+        def photo(m: Message):
+            izi_chat = self._reply_target(m)
+            if not izi_chat:
+                return self.send(m.chat.id, "Картинка не ожидалась. Чтобы отправить её собеседнику, ответьте "
+                                            "ею на уведомление о сообщении или нажмите «✉️ Ответить».")
+            data = bot.download_file(bot.get_file(m.photo[-1].file_id).file_path)
+            up = self.hub.client.upload_chat_image(data, "photo.jpg")
+            caption = (m.caption or "").strip()
+            self._send_to_chat(m.chat.id, izi_chat, (caption + "\n" if caption else "") + "\ufffc", [up["id"]])
+
         @bot.message_handler(func=lambda m: True, content_types=["text"])
         def text(m: Message):
             if not self.authorized(m.chat.id):
                 return self._try_login(m)
             if m.chat.id in self._pending:
                 return self._guard(self._handle_pending)(m)
+            izi_chat = self._reply_target(m)
+            if izi_chat:
+                return self._guard(lambda msg: self._send_to_chat(msg.chat.id, izi_chat, msg.text))(m)
             bot.send_message(m.chat.id, "📋 <b>Меню IziMarketHub</b>", reply_markup=self.main_menu())
 
         @bot.callback_query_handler(func=lambda c: True)
@@ -537,6 +770,25 @@ class TGBot:
             logger.warning(f"Неверный пароль Telegram-бота от {m.chat.id} (@{m.from_user.username})")
             self.bot.send_message(m.chat.id, "❌ Неверный пароль")
 
+    def _reply_target(self, m: Message) -> str | None:
+        """Чат IziMarket, куда отправить сообщение: ответ на уведомление или нажатая «✉️ Ответить»."""
+        if m.chat.id in self._pending and self._pending[m.chat.id][0] == "chr":
+            return self._pending.pop(m.chat.id)[1]
+        r = m.reply_to_message
+        if r:
+            rec = self._reply_map.get((m.chat.id, r.message_id))
+            return rec[0] if rec else None
+        return None
+
+    def _send_to_chat(self, tg_chat: int, izi_chat: str, text: str, images: list[str] | None = None) -> None:
+        try:
+            self.hub.send_message(izi_chat, text, images=images, by_bot=False)
+        except IziAPIError as e:
+            return self.send(tg_chat, f"❌ Не отправлено: {escape(e.message or str(e))}"
+                                      + (f" ({u.code(e.code)})" if e.code else ""))
+        kb = InlineKeyboardMarkup().add(Btn("📜 История", callback_data=f"chv:{izi_chat}"))
+        self.send(tg_chat, "✅ Отправлено", kb)
+
     def _ask(self, chat_id: int, action: str, arg: str, prompt: str) -> None:
         self._pending[chat_id] = (action, arg)
         self.send(chat_id, prompt + "\n\n/cancel — отмена")
@@ -553,6 +805,38 @@ class TGBot:
             self.hub.AD_CFG.set(sec, "response", txt.replace("\n", "\\n"))
             self.hub.save_ad_config()
             self.send(m.chat.id, "✅ Текст выдачи обновлён")
+        elif action == "chr":
+            self._send_to_chat(m.chat.id, arg, txt)
+        elif action == "tpa":
+            if txt.strip():
+                self.hub.store.update("answer_templates", lambda old: (old or []) + [txt.strip()])
+            self.send(m.chat.id, *self.templates_view())
+        elif action == "ara":
+            cmd = " ".join(txt.lower().split())
+            if not cmd or "[" in cmd or "]" in cmd:
+                return self.send(m.chat.id, "Команда не может быть пустой и содержать [ ]")
+            if not self.hub.AR_CFG.has_section(cmd):
+                self.hub.AR_CFG.add_section(cmd)
+                for k, (default, _) in AR_SCHEMA.items():
+                    self.hub.AR_CFG.set(cmd, k, default)
+            idx = self.hub.AR_CFG.sections().index(cmd)
+            self._ask(m.chat.id, "arr", str(idx), f"✏️ Теперь отправьте ответ на {u.code(cmd)}. "
+                                                  f"Переменные: {CHAT_VARS}")
+        elif action in ("arr", "arn"):
+            sec = self.hub.AR_CFG.sections()[int(arg)]
+            self.hub.AR_CFG.set(sec, "response" if action == "arr" else "notificationText", txt.replace("\n", "\\n"))
+            if action == "arn":
+                self.hub.AR_CFG.set(sec, "telegramNotification", "1")
+            self.hub.save_ar_config()
+            self.send(m.chat.id, *self.ar_edit_view(int(arg)))
+        elif action == "csx":
+            self.hub.MAIN_CFG.set("Chat", arg, txt.replace("\n", "\\n"))
+            self.hub.save_main_config()
+            self.send(m.chat.id, *self.chat_settings_view())
+        elif action == "bla":
+            for name in txt.replace(",", " ").split():
+                self.hub.blacklist_add(name)
+            self.send(m.chat.id, *self.blacklist_view())
         elif action in ("pprice", "pqty"):
             try:
                 value = float(txt.replace(",", ".").replace(" ", ""))
@@ -687,6 +971,87 @@ class TGBot:
             return self._edit(c, self.balance_text(), self._back())
         if cmd == "stats":
             return self._edit(c, self.stats_text(), self._back())
+        if cmd == "chl":
+            return self._edit(c, *self.chats_view(arg == "1"))
+        if cmd == "chv":
+            return self._show(c, *self.chat_view(arg), izi_chat=arg)
+        if cmd == "chr":
+            self.bot.answer_callback_query(c.id)
+            return self._ask(chat_id, "chr", arg, "✉️ Отправьте текст или картинку — уйдёт собеседнику")
+        if cmd == "ctp":
+            return self._show(c, *self.chat_templates_view(arg))
+        if cmd == "cts":
+            idx, izi_chat = arg.split(":", 1)
+            tpls = self.templates
+            if int(idx) >= len(tpls):
+                return self.bot.answer_callback_query(c.id, "Заготовка удалена")
+            self.bot.answer_callback_query(c.id)
+            chat = hub.client.get_chat(izi_chat)
+            return self._send_to_chat(chat_id, izi_chat, format_chat_text(tpls[int(idx)], chat))
+        if cmd == "crd":
+            r = hub.client.mark_chat_read(arg)
+            return self.bot.answer_callback_query(c.id, f"Прочитано, непрочитанных: {r.get('unread_count', 0)}")
+        if cmd == "cbl":
+            chat = hub.client.get_chat(arg)
+            name = chat.counterpart.username
+            if name:
+                hub.blacklist_remove(name) if hub.is_blacklisted(name) else hub.blacklist_add(name)
+            return self._edit(c, *self.chat_view(arg))
+        if cmd == "ord":
+            order = hub.client.get_order(arg)
+            self.bot.answer_callback_query(c.id)
+            return self.send(chat_id, u.order_text(order, "🧾 Сделка"), self._order_markup(order))
+        if cmd == "tpl":
+            return self._edit(c, *self.templates_view())
+        if cmd == "tpa":
+            self.bot.answer_callback_query(c.id)
+            return self._ask(chat_id, "tpa", "", f"📝 Отправьте текст заготовки. Переменные: {CHAT_VARS}")
+        if cmd == "tpd":
+            i = int(arg)
+            hub.store.update("answer_templates", lambda old: [t for j, t in enumerate(old or []) if j != i])
+            return self._edit(c, *self.templates_view())
+        if cmd == "ar":
+            return self._edit(c, *self.ar_view(int(arg or 0)))
+        if cmd == "are":
+            return self._edit(c, *self.ar_edit_view(int(arg)))
+        if cmd == "art":
+            idx, key = arg.split(":")
+            sec = hub.AR_CFG.sections()[int(idx)]
+            hub.AR_CFG.set(sec, key, "0" if is_true(hub.AR_CFG.get(sec, key)) else "1")
+            hub.save_ar_config()
+            return self._edit(c, *self.ar_edit_view(int(idx)))
+        if cmd == "ara":
+            self.bot.answer_callback_query(c.id)
+            return self._ask(chat_id, "ara", "", "🤖 Отправьте команду, на которую отвечать (например, !помощь). "
+                                                 "Несколько вариантов — через |")
+        if cmd in ("arr", "arn"):
+            self.bot.answer_callback_query(c.id)
+            what = "ответ на команду" if cmd == "arr" else "текст уведомления в Telegram"
+            return self._ask(chat_id, cmd, arg, f"✏️ Отправьте {what}. Переменные: {CHAT_VARS}")
+        if cmd == "ard":
+            hub.AR_CFG.remove_section(hub.AR_CFG.sections()[int(arg)])
+            hub.save_ar_config()
+            return self._edit(c, *self.ar_view(0))
+        if cmd == "chs":
+            return self._edit(c, *self.chat_settings_view())
+        if cmd == "cst":
+            hub.toggle_setting("Chat", arg)
+            return self._edit(c, *self.chat_settings_view())
+        if cmd == "csx":
+            self.bot.answer_callback_query(c.id)
+            variables = CHAT_VARS if arg == "greetingsText" else ORDER_VARS
+            return self._ask(chat_id, "csx", arg, f"✏️ Отправьте новый текст. Переменные: {variables}")
+        if cmd == "bl":
+            return self._edit(c, *self.blacklist_view())
+        if cmd == "blt":
+            hub.toggle_setting("Blacklist", arg)
+            return self._edit(c, *self.blacklist_view())
+        if cmd == "bld":
+            hub.blacklist_remove(arg)
+            return self._edit(c, *self.blacklist_view())
+        if cmd == "bla":
+            self.bot.answer_callback_query(c.id)
+            return self._ask(chat_id, "bla", "", "🚫 Отправьте ник (или несколько через пробел)")
         if cmd == "pl":
             return self._edit(c, *self.plugins_view())
         if cmd == "plt":
@@ -716,7 +1081,7 @@ class TGBot:
     def start(self) -> None:
         try:
             self.bot.set_my_commands([
-                BotCommand("menu", "Меню"), BotCommand("orders", "Последние сделки"),
+                BotCommand("menu", "Меню"), BotCommand("chats", "Чаты"), BotCommand("orders", "Последние сделки"),
                 BotCommand("balance", "Баланс"), BotCommand("stats", "Статистика за 7 дней"),
                 BotCommand("deliver", "Выдать сделку вручную"), BotCommand("logs", "Файл логов"),
                 BotCommand("update", "Обновить бота из GitHub"), BotCommand("restart", "Перезапустить"),

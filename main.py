@@ -9,7 +9,8 @@ import sys
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-from Utils.config_loader import MAIN_CFG, ConfigError, load_auto_delivery_config, load_main_config  # noqa: E402
+from Utils.config_loader import (MAIN_CFG, ConfigError, load_auto_delivery_config,  # noqa: E402
+                                 load_auto_response_config, load_main_config)
 from Utils.logger import setup_logging  # noqa: E402
 
 LOGO = r"""
@@ -37,6 +38,7 @@ def main() -> None:
     try:
         main_cfg = load_main_config()
         ad_cfg = load_auto_delivery_config()
+        ar_cfg = load_auto_response_config()
     except ConfigError as e:
         sys.exit(f"Ошибка конфига: {e}")
 
@@ -46,7 +48,7 @@ def main() -> None:
     from handlers import register_handlers
     from hub import IziMarketHub
 
-    hub = IziMarketHub(main_cfg, ad_cfg)
+    hub = IziMarketHub(main_cfg, ad_cfg, ar_cfg)
     # уведомления — первыми, чтобы «новая сделка» приходила раньше «выдана»
     if main_cfg.getboolean("Telegram", "enabled"):
         from tg_bot.bot import TGBot
@@ -56,7 +58,8 @@ def main() -> None:
 
     hub.load_plugins()
     hub.init()
-    log.info(f"Автовыдача настроена для {len(ad_cfg.sections())} товаров")
+    log.info(f"Автовыдача настроена для {len(ad_cfg.sections())} товаров, "
+             f"автоответчик — {len(ar_cfg.sections())} команд")
 
     webhook = None
     if main_cfg.getboolean("Webhook", "enabled"):

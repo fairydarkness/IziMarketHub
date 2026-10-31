@@ -9,6 +9,7 @@ import re
 CONFIG_DIR = "configs"
 MAIN_CFG = os.path.join(CONFIG_DIR, "_main.cfg")
 AD_CFG = os.path.join(CONFIG_DIR, "auto_delivery.cfg")
+AR_CFG = os.path.join(CONFIG_DIR, "auto_response.cfg")
 GOODS_DIR = os.path.join("storage", "products")
 
 BOOL_TRUE = {"1", "true", "yes", "on", "да"}
@@ -32,6 +33,26 @@ MAIN_SCHEMA: dict[str, dict[str, tuple[str, str]]] = {
         "checkInterval": ("300", "int:60"),
         "threshold": ("5", "int:0"),
         "batch": ("50", "int:1"),
+    },
+    "Chat": {
+        "enabled": ("1", "bool"),
+        "pollInterval": ("10", "int:3"),
+        "autoResponse": ("1", "bool"),
+        "greetings": ("0", "bool"),
+        "greetingsText": ("Здравствуйте, $username! Скоро отвечу.", "str"),
+        "greetingsCooldown": ("2", "int:0"),
+        "greetingsOrderChats": ("0", "bool"),
+        "newOrderReply": ("0", "bool"),
+        "newOrderReplyText": ("Спасибо за заказ «$product_title», $username!", "str"),
+        "orderConfirmReply": ("0", "bool"),
+        "orderConfirmReplyText": ("$username, спасибо, что подтвердили заказ! Буду рад отзыву.", "str"),
+        "markReadAfterResponse": ("0", "bool"),
+        "notifyOwnMessages": ("0", "bool"),
+    },
+    "Blacklist": {
+        "blockDelivery": ("0", "bool"),
+        "blockResponse": ("1", "bool"),
+        "blockNotifications": ("0", "bool"),
     },
     "Telegram": {
         "enabled": ("0", "bool"),
@@ -135,6 +156,34 @@ def load_auto_delivery_config(path: str = AD_CFG) -> configparser.ConfigParser:
         fname = cfg.get(section, "productsFileName")
         if fname and not re.fullmatch(r"[\w\-. ]+\.txt", fname):
             raise ConfigError(f"{path}: [{section}] productsFileName — имя .txt файла из {GOODS_DIR}")
+    return cfg
+
+
+AR_SCHEMA: dict[str, tuple[str, str]] = {
+    "response": ("", "str"),
+    "contains": ("0", "bool"),
+    "disable": ("0", "bool"),
+    "telegramNotification": ("0", "bool"),
+    "notificationText": ("", "str"),
+}
+
+
+def load_auto_response_config(path: str = AR_CFG) -> configparser.ConfigParser:
+    """Автоответчик: имя секции — команда (несколько через |), response — ответ."""
+    cfg = new_parser()
+    if not os.path.exists(path):
+        return cfg
+    cfg.read(path, encoding="utf-8")
+    for section in cfg.sections():
+        for key, (default, rule) in AR_SCHEMA.items():
+            if not cfg.has_option(section, key):
+                cfg.set(section, key, default)
+            _check(section, key, cfg.get(section, key), rule, path)
+        unknown = set(cfg.options(section)) - set(AR_SCHEMA)
+        if unknown:
+            raise ConfigError(f"{path}: [{section}] неизвестные параметры: {', '.join(sorted(unknown))}")
+        if not cfg.get(section, "response") and not is_true(cfg.get(section, "telegramNotification")):
+            raise ConfigError(f"{path}: [{section}] нужен response и/или telegramNotification = 1")
     return cfg
 
 

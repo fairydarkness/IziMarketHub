@@ -26,6 +26,8 @@ class FakeAPI:
         self.stock: dict[str, list[dict]] = {}
         self.calls: list[tuple[str, str, dict | None]] = []
         self.deliver_status: int | None = None  # подменить ответ выдачи
+        self.chats: dict[str, dict] = {}
+        self.messages: dict[str, list[dict]] = {}
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.url = f"http://127.0.0.1:{self.httpd.server_port}{PREFIX}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -46,6 +48,30 @@ class FakeAPI:
                             "product_title": self.products[pid]["title"], "created_at": now(),
                             "updated_at": now(), "buyer": {"id": "b1", "username": username,
                                                            "inputs": {"nick": "kiwi_game"}, "parameters": []}}
+
+    def add_chat(self, cid: str, username: str = "kiwi", order_id: str | None = None):
+        self.chats[cid] = {"id": cid, "type": "order" if order_id else "direct", "created_at": now(),
+                           "counterpart": {"id": "b1", "number": 1, "username": username, "verified_seller": False},
+                           "order": {"id": order_id, "title": "Robux", "role": "seller"} if order_id else None,
+                           "last_seq": 0, "last_read_seq": 0, "counterpart_last_read_seq": 0, "unread_count": 0,
+                           "last_message": None, "last_message_at": now()}
+        self.messages[cid] = []
+
+    def add_message(self, cid: str, text: str, author: str = "counterpart", client_message_id: str | None = None,
+                    created_at: str | None = None) -> dict:
+        c = self.chats[cid]
+        c["last_seq"] += 1
+        m = {"id": f"m{cid}{c['last_seq']}", "seq": c["last_seq"], "type": "text", "author": author,
+             "staff_role": None, "text": text, "images": [], "attachments": [], "reply_to": None,
+             "automatic": False, "deleted": False, "redacted": False, "withheld": False, "visibility": "all",
+             "system": None, "read_by_counterpart": None, "client_message_id": client_message_id,
+             "created_at": created_at or now()}
+        self.messages[cid].append(m)
+        c["last_message"] = m
+        c["last_message_at"] = m["created_at"]
+        if author == "counterpart":
+            c["unread_count"] += 1
+        return m
 
     # --- сервер
     def _handler(self):
@@ -84,7 +110,8 @@ class FakeAPI:
                 if path == "/me":
                     return self._send(200, {"user_id": "u1", "username": "shop", "key": {
                         "prefix": "izp_test", "scopes": ["orders:read", "orders:write", "products:read",
-                                                         "products:write", "stock:read", "stock:write"],
+                                                         "products:write", "stock:read", "stock:write",
+                                                         "chats:read", "chats:write"],
                         "expires_at": "2030-01-01T00:00:00+00:00"}})
                 if path == "/balance":
                     return self._send(200, {"balance": money(170000), "held": money(5000),
@@ -121,6 +148,30 @@ class FakeAPI:
                             return self._err(409, "order_state_invalid", current_status=o["status"])
                         o.update(status="delivered", updated_at=now(), delivered=body)
                     return self._send(200, o)
+                if path == "/chats":
+                    items = sorted(api.chats.values(), key=lambda c: (c["last_message_at"], c["last_seq"]),
+                                   reverse=True)
+                    if "order_id" in params:
+                        items = [c for c in items if (c["order"] or {}).get("id") == params["order_id"]]
+                    return self._send(200, {"items": items, "has_next_page": False, "next_cursor": None})
+                m = re.fullmatch(r"/chats/([^/]+)(/messages|/read)?", path)
+                if m:
+                    c = api.chats.get(m.group(1))
+                    if not c:
+                        return self._err(404, "conversation_not_found")
+                    if m.group(2) == "/messages" and method == "POST":
+                        if "Idempotency-Key" not in self.headers:
+                            return self._err(400, "no_idempotency_key")
+                        msg = api.add_message(c["id"], body.get("text", ""), "me", body.get("client_message_id"))
+                        return self._send(201, msg)
+                    if m.group(2) == "/messages":
+                        after = int(params.get("after_seq", 0))
+                        items = [x for x in api.messages[c["id"]] if x["seq"] > after]
+                        return self._send(200, {"items": items, "has_next_page": False, "next_cursor": None})
+                    if m.group(2) == "/read":
+                        c["unread_count"] = 0
+                        return self._send(200, {"last_read_seq": c["last_seq"], "unread_count": 0})
+                    return self._send(200, {**c, "can_write": True, "write_blocked_reason": None})
                 if path == "/products":
                     return self._send(200, {"items": list(api.products.values()), "has_next_page": False})
                 m = re.fullmatch(r"/products/([^/]+)(/[a-z]+)?", path)

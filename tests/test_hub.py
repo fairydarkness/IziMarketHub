@@ -277,8 +277,10 @@ def test_tg_menu_pages_balance_stats(api, hub, monkeypatch):
     p1 = buttons(tg.main_menu(0))
     p2 = buttons(tg.main_menu(1))
     assert "orders" in p1 and "sw" not in p1 and "menu:1" in p1 and "menu:-1" not in p1
-    assert "sw" in p2 and "orders" not in p2 and "menu:0" in p2 and "menu:2" not in p2
-    assert len(MENU_PAGES) == 2
+    p3 = buttons(tg.main_menu(2))
+    assert "sw" in p2 and "orders" not in p2 and "menu:0" in p2 and "menu:2" in p2
+    assert "about" in p3 and "menu:3" not in p3
+    assert len(MENU_PAGES) == 3
     click("menu:1")
     assert "sw" in buttons(shown[-1][2])
     click("noop")
@@ -387,3 +389,151 @@ def test_old_order_payout_is_not_new_order(api, hub):
     stamp("legacy", paid_out_at=datetime.now(timezone.utc).isoformat())
     hub.poll_orders()
     assert hub.events == []
+
+
+C1 = "c1111111-1111-4111-8111-111111111111"
+C2 = "c2222222-2222-4222-8222-222222222222"
+
+
+def test_chats_poll_autoresponse_greetings(api, hub):
+    hub.AR_CFG.read_string("[!помощь|!help]\nresponse = $username, вот помощь\n"
+                           "[цена]\nresponse = Цена в описании\ncontains = 1\n")
+    for sec in hub.AR_CFG.sections():
+        for k, (d, _) in cl.AR_SCHEMA.items():
+            if not hub.AR_CFG.has_option(sec, k):
+                hub.AR_CFG.set(sec, k, d)
+    hub.MAIN_CFG.set("Chat", "greetings", "1")
+    got = []
+    hub.add_handler("NEW_MESSAGE", lambda h, chat, m: got.append((chat.id, m.text)))
+
+    # старая переписка до первого запуска — не новая
+    api.add_chat(C1)
+    api.add_message(C1, "старое", created_at="2026-01-01T00:00:00+00:00")
+    hub.init_chats()
+    hub.poll_chats()
+    assert got == []
+
+    # команда: отвечает автоответчик, приветствия на команду нет
+    api.add_message(C1, "  !HELP ")
+    hub.poll_chats()
+    assert got == [(C1, "  !HELP ")]
+    assert api.messages[C1][-1]["text"] == "kiwi, вот помощь" and api.messages[C1][-1]["author"] == "me"
+    # своё сообщение бота не приходит как новое
+    hub.poll_chats()
+    assert len(got) == 1
+
+    # «contains» срабатывает внутри текста
+    api.add_chat(C2, username="melon")
+    api.add_message(C2, "Здравствуйте, какая цена?")
+    hub.poll_chats()
+    texts = [m["text"] for m in api.messages[C2] if m["author"] == "me"]
+    assert texts == ["Цена в описании"]  # на команду — только автоответ
+
+    api.add_message(C2, "ещё вопрос")
+    hub.poll_chats()
+    assert [m["text"] for m in api.messages[C2] if m["author"] == "me"] == ["Цена в описании"]
+
+    # новый собеседник — приветствие
+    C3 = "c3333333-3333-4333-8333-333333333333"
+    api.add_chat(C3, username="grape")
+    api.add_message(C3, "привет")
+    hub.poll_chats()
+    assert [m["text"] for m in api.messages[C3] if m["author"] == "me"] == ["Здравствуйте, grape! Скоро отвечу."]
+    api.add_message(C3, "ау")
+    hub.poll_chats()  # повторно не здороваемся
+    assert len([m for m in api.messages[C3] if m["author"] == "me"]) == 1
+
+    # чёрный список: автоответа нет
+    hub.blacklist_add("@Kiwi")
+    assert hub.is_blacklisted("kiwi")
+    api.add_message(C1, "!помощь")
+    hub.poll_chats()
+    assert api.messages[C1][-1]["author"] == "counterpart"
+
+
+def test_order_chat_replies(api, hub):
+    hub.MAIN_CFG.set("Chat", "newOrderReply", "1")
+    hub.MAIN_CFG.set("Chat", "orderConfirmReply", "1")
+    api.add_product(P_MANUAL, "Ключ Hades")
+    hub.goods.add("keys.txt", ["K1"])
+    hub.poll_orders()
+    api.add_order("o5", P_MANUAL)
+    api.add_chat(C1, order_id="o5")
+    hub.poll_orders()
+    import time as _t
+    for _ in range(50):
+        if api.messages[C1]:
+            break
+        _t.sleep(0.05)
+    assert api.messages[C1][0]["text"] == "Спасибо за заказ «Ключ Hades», kiwi!"
+    api.orders["o5"].update(status="completed", updated_at="2099-01-01T00:00:00+00:00")
+    hub.poll_orders()
+    for _ in range(50):
+        if len(api.messages[C1]) > 1:
+            break
+        _t.sleep(0.05)
+    assert "спасибо, что подтвердили" in api.messages[C1][1]["text"]
+
+
+def test_tg_chats(api, hub, monkeypatch):
+    from types import SimpleNamespace
+    from tg_bot.bot import TGBot
+    hub.MAIN_CFG.set("Telegram", "token", "123:fake")
+    tg = TGBot(hub)
+    tg._authorize(1)
+    shown = []
+    sent_id = [100]
+
+    def fake_send(chat, text, markup=None):
+        sent_id[0] += 1
+        shown.append(("send", text, markup))
+        return SimpleNamespace(chat=SimpleNamespace(id=int(chat)), message_id=sent_id[0])
+    monkeypatch.setattr(tg, "_edit", lambda c, text, kb=None: shown.append((c.data, text, kb)))
+    monkeypatch.setattr(tg, "send", fake_send)
+    monkeypatch.setattr(tg.bot, "answer_callback_query", lambda *a, **k: None)
+    tg.bind()
+
+    api.add_chat(C1, order_id="o1")
+    hub.init_chats()
+    api.add_message(C1, "Когда <выдача>?")
+    hub.poll_chats()
+    assert "Когда &lt;выдача&gt;?" in shown[-1][1] and "kiwi" in shown[-1][1]
+    notif_id = sent_id[0]
+
+    # ответ на уведомление уходит собеседнику
+    msg = SimpleNamespace(chat=SimpleNamespace(id=1), text="Уже выдал",
+                          reply_to_message=SimpleNamespace(message_id=notif_id))
+    target = tg._reply_target(msg)
+    assert target == C1
+    tg._send_to_chat(1, target, msg.text)
+    assert api.messages[C1][-1]["text"] == "Уже выдал"
+
+    def click(data, mid=1):
+        tg._callback(SimpleNamespace(id="1", data=data, message=SimpleNamespace(chat=SimpleNamespace(id=1),
+                                                                              message_id=mid)))
+        return shown[-1]
+
+    hub.store.set("answer_templates", ["Привет, $username!"])
+    for data in ("chl:0", "chl:1", f"chv:{C1}", f"ctp:{C1}", f"crd:{C1}", f"cbl:{C1}", "tpl", "ar:0", "chs",
+                 "cst:greetings", "bl", "blt:blockDelivery", "bld:kiwi", "menu:1", "menu:2"):
+        click(data)
+    assert hub.chat_setting("greetings") is True
+    assert not hub.is_blacklisted("kiwi")
+    # окно чата из уведомления открывается новым сообщением, а не поверх уведомления
+    n = len(shown)
+    click(f"chv:{C1}", mid=notif_id)
+    assert shown[n][0] == "send"
+    click(f"cts:0:{C1}")
+    assert api.messages[C1][-1]["text"] == "Привет, kiwi!"
+    assert all(len(b.callback_data or "") <= 64 for _, _, kb in shown if kb
+               for row in kb.keyboard for b in row)
+
+    # автоответчик из Telegram: команда → ответ
+    tg._pending[1] = ("ara", "")
+    tg._handle_pending(SimpleNamespace(chat=SimpleNamespace(id=1), text="!Цена"))
+    tg._handle_pending(SimpleNamespace(chat=SimpleNamespace(id=1), text="100 ₽"))
+    assert hub.AR_CFG.get("!цена", "response") == "100 ₽"
+    assert os.path.exists(cl.AR_CFG)
+    click("are:0")
+    click("art:0:telegramNotification")
+    assert hub.AR_CFG.get("!цена", "telegramNotification") == "1"

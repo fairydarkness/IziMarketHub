@@ -193,6 +193,119 @@ class Balance:
 
 
 @dataclass
+class Counterpart:
+    id: str | None
+    number: int | None
+    username: str | None
+    verified_seller: bool
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> Counterpart:
+        d = d or {}
+        return cls(d.get("id"), d.get("number"), d.get("username"), bool(d.get("verified_seller")))
+
+
+@dataclass
+class ChatMessage:
+    """Сообщение чата. ``author``: ``me`` — вы, ``counterpart`` — собеседник, иначе сотрудник/система."""
+    id: str
+    seq: int
+    type: str
+    author: str
+    text: str
+    images: list
+    reply_to: dict | None
+    automatic: bool
+    deleted: bool
+    withheld: bool
+    system: dict | None
+    client_message_id: str | None
+    created_at: datetime | None
+    raw: dict
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ChatMessage:
+        return cls(
+            id=d["id"],
+            seq=int(d.get("seq") or 0),
+            type=d.get("type") or "text",
+            author=d.get("author") or "",
+            text=d.get("text") or "",
+            images=d.get("images") or [],
+            reply_to=d.get("reply_to"),
+            automatic=bool(d.get("automatic")),
+            deleted=bool(d.get("deleted") or d.get("redacted")),
+            withheld=bool(d.get("withheld")),
+            system=d.get("system"),
+            client_message_id=d.get("client_message_id"),
+            created_at=parse_dt(d.get("created_at")),
+            raw=d,
+        )
+
+    @property
+    def by_me(self) -> bool:
+        return self.author == "me"
+
+    @property
+    def by_counterpart(self) -> bool:
+        return self.author == "counterpart"
+
+    @property
+    def by_staff(self) -> bool:
+        return bool(self.raw.get("staff_role")) or self.author in ("staff", "arbiter", "support")
+
+
+@dataclass
+class Chat:
+    id: str
+    type: str                 # direct / order
+    counterpart: Counterpart
+    order_id: str | None
+    order_title: str | None
+    last_seq: int
+    last_read_seq: int
+    unread_count: int
+    last_message: ChatMessage | None
+    last_message_at: datetime | None
+    can_write: bool | None
+    write_blocked_reason: str | None
+    raw: dict
+    #: заполняет IziMarketHub: бот видит чат впервые / когда было предыдущее известное сообщение
+    is_new: bool = False
+    prev_message_at: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Chat:
+        order = d.get("order") or {}
+        lm = d.get("last_message")
+        return cls(
+            id=d["id"],
+            type=d.get("type") or "direct",
+            counterpart=Counterpart.from_dict(d.get("counterpart")),
+            order_id=order.get("id"),
+            order_title=order.get("title"),
+            last_seq=int(d.get("last_seq") or 0),
+            last_read_seq=int(d.get("last_read_seq") or 0),
+            unread_count=int(d.get("unread_count") or 0),
+            last_message=ChatMessage.from_dict(lm) if lm else None,
+            last_message_at=parse_dt(d.get("last_message_at")),
+            can_write=d.get("can_write"),
+            write_blocked_reason=d.get("write_blocked_reason"),
+            raw=d,
+        )
+
+    @property
+    def username(self) -> str:
+        return self.counterpart.username or "собеседник"
+
+    @property
+    def url(self) -> str:
+        if self.order_id:
+            return f"https://izi.market/orders/{self.order_id}"
+        return "https://izi.market/chat"
+
+
+@dataclass
 class WebhookEvent:
     id: str
     type: str
